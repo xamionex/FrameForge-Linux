@@ -10,7 +10,7 @@ mod memory_scanner;
 mod ocr;
 mod wfcd;
 
-use db::QuantityChange;
+use db::{QuantityChange, Trade};
 use wfcd::{RecipeComponent, WfcdItem};
 
 pub struct AppState {
@@ -1240,6 +1240,49 @@ fn get_change_log(state: State<AppState>, limit: i64) -> Result<Vec<QuantityChan
     db::get_quantity_changes(&conn, limit).map_err(|e| e.to_string())
 }
 
+// ─── Trade log ────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn get_trades(state: State<AppState>) -> Result<Vec<Trade>, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    db::get_trades(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn add_trade(
+    state: State<AppState>,
+    with_player: String,
+    direction: String,
+    item_name: String,
+    item_url: String,
+    quantity: i64,
+    platinum: i64,
+    source: String,
+    notes: String,
+) -> Result<i64, String> {
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let trade = Trade {
+        id: 0,
+        timestamp,
+        with_player,
+        direction,
+        item_name,
+        item_url,
+        quantity,
+        platinum,
+        source,
+        notes,
+    };
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    db::add_trade(&conn, &trade).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_trade(state: State<AppState>, id: i64) -> Result<(), String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    db::delete_trade(&conn, id).map_err(|e| e.to_string())
+}
+
 fn update_version_in_file(path: &std::path::Path, version: &str) -> Result<(), String> {
     let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     // Replace first occurrence of "version": "x.y.z"
@@ -1725,6 +1768,7 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
             // We accumulate it across poll iterations so it's ready when OCR starts.
             let mut vp_in_seq        = false;
             let mut vp_seq_completed = false; // set when sequence finishes; used as fallback trigger
+            let mut pending_trade: Option<String> = None; // last seen trade confirmation dialog
             let mut vp_other_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut vp_own_item = String::new(); // local player's reward path from EE.log
             let mut ee_squad_size: Option<usize> = None; // committed when sequence completes
@@ -1823,6 +1867,113 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                         "price": price,
                         "timestamp": chrono::Local::now().format("%H:%M:%S").to_string(),
                     }));
+                }
+
+                // ── In-game trade detection ──────────────────────────────────────
+                // Warframe writes a confirmation dialog to EE.log when the trade
+                // window is accepted, then a success dialog when it completes.
+                //
+                // Confirmation: Dialog::CreateOkCancel(description=Are you sure you
+                //   want to accept this trade? You are offering:\nPlatinum x N\n
+                //   and will receive from PLAYER the following:\nITEM, title=...)
+                //
+                // Success: Dialog::CreateOk(description=The trade was successful!...)
+                if lower.contains("dialog::createokcancel") && lower.contains("you are offering") {
+                    pending_trade = Some(buf.clone());
+                }
+
+                if lower.contains("the trade was successful") {
+                    if let Some(ref trade_raw) = pending_trade.clone() {
+                        let r = trade_raw.as_str();
+
+                        // Extract trading partner
+                        let with_player = r.find("will receive from ")
+                            .and_then(|i| {
+                                let after = &r[i + 18..];
+                                after.find(" the following").map(|j| after[..j].trim().to_string())
+                            })
+                            .unwrap_or_default();
+
+                        // Extract what YOU offered (between "You are offering:" and "and will receive from")
+                        let offered = r.find("You are offering:")
+                            .and_then(|i| {
+                                let after = &r[i + 17..];
+                                after.find("and will receive from").map(|j| after[..j].trim().to_string())
+                            })
+                            .unwrap_or_default();
+
+                        // Extract what you RECEIVED (between "the following:" and ", title=")
+                        let received = r.find("the following:")
+                            .and_then(|i| {
+                                let after = &r[i + 14..];
+                                after.find(", title=").map(|j| after[..j].trim().to_string())
+                            })
+                            .unwrap_or_default();
+
+                        // Parse platinum amounts
+                        let parse_plat = |s: &str| -> i64 {
+                            s.find("Platinum x ")
+                                .and_then(|i| s[i + 11..].split(|c: char| !c.is_ascii_digit()).next())
+                                .and_then(|n| n.parse().ok())
+                                .unwrap_or(0)
+                        };
+                        let plat_offered  = parse_plat(&offered);
+                        let plat_received = parse_plat(&received);
+
+                        // Extract item name + rank and count quantity.
+                        // EE.log format: "Item Name (RARITY RANK N)" — kept as "Item Name (RN)"
+                        // so rank is visible in the trade history.
+                        let extract_item_and_qty = |section: &str| -> (String, i64) {
+                            let first = section.lines().find(|l| {
+                                let t = l.trim();
+                                !t.is_empty() && !t.to_lowercase().contains("platinum")
+                            });
+                            let full_name = first.map(|l| {
+                                let l = l.trim();
+                                if let Some(p) = l.find(" (") {
+                                    let inside = &l[p+2..];
+                                    let ll = inside.to_lowercase();
+                                    if let Some(r) = ll.find("rank ") {
+                                        let rank_n = inside[r+5..].trim_end_matches(')').trim();
+                                        format!("{} (R{})", &l[..p], rank_n)
+                                    } else {
+                                        l[..p].trim().to_string()
+                                    }
+                                } else {
+                                    l.to_string()
+                                }
+                            }).unwrap_or_default();
+                            // Base name (before rank) for counting repeated lines
+                            let base = full_name.find(" (R").map(|i| &full_name[..i]).unwrap_or(&full_name);
+                            let qty = if base.is_empty() { 0 } else {
+                                section.lines()
+                                    .filter(|l| l.to_lowercase().contains(&base.to_lowercase()))
+                                    .count() as i64
+                            };
+                            (full_name, qty.max(1))
+                        };
+
+                        // Determine direction, item, quantity, platinum
+                        let (direction, item_name, quantity, platinum) = if plat_offered > 0 {
+                            // Paid platinum → bought something
+                            let (item, qty) = extract_item_and_qty(&received);
+                            ("bought", item, qty, plat_offered)
+                        } else {
+                            // Received platinum → sold something
+                            let (item, qty) = extract_item_and_qty(&offered);
+                            ("sold", item, qty, plat_received)
+                        };
+
+                        let _ = ee_ocr_app.emit("trade-completed", serde_json::json!({
+                            "withPlayer": with_player,
+                            "direction":  direction,
+                            "itemName":   item_name,
+                            "quantity":   quantity,
+                            "platinum":   platinum,
+                            "timestamp":  chrono::Local::now().to_rfc3339(),
+                        }));
+                    }
+                    pending_trade = None;
                 }
 
                 // Trigger: "ProjectionRewardChoice.lua: Relic rewards initialized" fires
@@ -3213,6 +3364,9 @@ pub fn run() {
             get_item_list_status,
             fetch_item_list,
             get_change_log,
+            get_trades,
+            add_trade,
+            delete_trade,
             clear_cache,
             load_settings,
             save_settings,

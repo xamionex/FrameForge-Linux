@@ -250,12 +250,24 @@ function MessagesPanel({ username: _username }: { username: string }) {
     });
   };
 
-  const copySold = (from: string, item?: string) => {
+  const copySold = (from: string, item?: string, price?: number) => {
     const msg = item
       ? `/w ${from} ${item} sold! Thank you.`
       : `/w ${from} Sold! Thank you.`;
     navigator.clipboard.writeText(msg);
-    // Remove the whisper from list after marking sold
+    // Auto-log the trade to Statistics
+    if (item) {
+      invoke("add_trade", {
+        withPlayer: from,
+        direction: "sold",
+        itemName: item,
+        itemUrl: "",
+        quantity: 1,
+        platinum: price ?? 0,
+        source: "wfm",
+        notes: "",
+      }).catch(() => {});
+    }
     setWhispers(prev => prev.filter(w => w.from !== from));
   };
 
@@ -287,7 +299,7 @@ function MessagesPanel({ username: _username }: { username: string }) {
                 <button className="wfm-btn-sm wfm-btn-invite" onClick={() => copyInvite(w.from)}>
                   {copied === w.from ? "✓ Copied!" : "📋 Copy invite"}
                 </button>
-                <button className="wfm-btn-sm wfm-btn-sold" onClick={() => copySold(w.from, w.item)}>
+                <button className="wfm-btn-sm wfm-btn-sold" onClick={() => copySold(w.from, w.item, w.price)}>
                   ✓ Sold
                 </button>
                 <button className="wfm-btn-sm" onClick={() => setWhispers(prev => prev.filter((_, j) => j !== i))}>

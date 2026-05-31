@@ -8,6 +8,7 @@ import Foundry from "./Foundry";
 import MarketHelper from "./MarketHelper";
 import RelicHelper from "./RelicHelper";
 import TimerHelper, { FissureWatch } from "./TimerHelper";
+import Statistics from "./Statistics";
 import Overlay from "./Overlay";
 import ModularWindow from "./ModularWindow";
 import { HelpTip } from "./HelpTip";
@@ -74,7 +75,7 @@ interface InventoryUpdate {
   scanned_at: number;
 }
 
-type Module = "inventory" | "foundry" | "market" | "relics" | "timers";
+type Module = "inventory" | "foundry" | "market" | "relics" | "timers" | "statistics";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -1472,6 +1473,14 @@ export default function App() {
             <img src="/timers-icon.png" alt="" style={{ width: 24, height: 24, objectFit: "contain" }} />
             <span className="module-label">Timers</span>
           </button>
+          <button
+            className={`module-btn ${activeModule === "statistics" ? "module-active" : ""}`}
+            onClick={() => setActiveModule("statistics")}
+            title="Statistics"
+          >
+            <img src="/statistics-icon.png" alt="" style={{ width: 24, height: 24, objectFit: "contain" }} />
+            <span className="module-label">Statistics</span>
+          </button>
         </nav>
 
         {/* ── Inventory module ── */}
@@ -1698,6 +1707,13 @@ export default function App() {
               onRemoveWatch={id => setFissureWatches(prev => prev.filter(w => w.id !== id))}
               quantities={mergedQty}
             />
+          </ErrorBoundary>
+        )}
+
+        {/* ── Statistics module ── */}
+        {activeModule === "statistics" && (
+          <ErrorBoundary>
+            <Statistics />
           </ErrorBoundary>
         )}
 

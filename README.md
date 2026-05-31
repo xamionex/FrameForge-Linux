@@ -1,4 +1,4 @@
-# FrameForge — Warframe Companion `v1.3.0`
+# FrameForge — Warframe Companion `v1.4.0`
 
 A desktop companion for Warframe that shows your live inventory, tracks crafting recipes, displays market prices, runs a full trading desk, manages a live timer dashboard, and auto-detects relic reward screens — all without modifying the game.
 
@@ -46,6 +46,23 @@ A live dashboard fetching data directly from DE's official Warframe worldstate:
 - **Fissure Watches** — configure Mode + Tier + Mission Type filters; matching fissures are highlighted in the fissure list and auto-surfaced in the Modular Window
 
 Any timer can be pinned to the Modular Window for at-a-glance viewing.
+
+### Statistics — Trade Tracker & Reports
+A full trade history and analytics dashboard, automatically populated from your activity:
+
+**Trades tab:**
+- Every in-game trade is detected automatically from `EE.log` the moment "The trade was successful!" appears — no button to press
+- WFM trades are logged automatically when you click **✓ Sold** in the Messages tab
+- Manual entry form for trades made outside of FrameForge
+- Each trade records: item name (with mod rank e.g. `Ammo Case (R0)`), quantity, platinum, trading partner, direction, source, and timestamp
+
+**Reports tab:**
+- Date range filter: Today / 7 Days / 30 Days / 90 Days / YTD / 1 Year / All Time
+- KPI cards: total earned, total spent, net profit, average per trade
+- **Cumulative platinum chart** — running net profit over time
+- **Daily bar chart** — green bars on days you earned, red bars on days you spent
+- **Items breakdown table** — every item with # sold, # bought, average sell price, and net platinum; sorted by most profitable
+- **Top trading partners** — top 10 players by total platinum exchanged
 
 ### OCR Relic Reward Overlay
 When a void fissure reward screen opens in-game, FrameForge automatically captures and reads all four reward cards using Windows OCR and displays a transparent overlay with each item's platinum price, ducat value, and set completion — so you can pick the best reward instantly without alt-tabbing. Priority mode is configurable: Item Completion, Most Set Value, Most Plat, or Most Ducats.
@@ -151,7 +168,7 @@ Item and recipe data is fetched on first launch and cached to disk:
 
 - **No account required** for inventory scanning, Foundry, Market Helper, Relic Helper, or Timers
 - **No telemetry** — FrameForge has no server and makes no analytics calls
-- **Local storage only** — a SQLite database of your quantity changes at `%LOCALAPPDATA%\warframe-companion\`
+- **Local storage only** — a SQLite database of your quantity changes and trade history at `%LOCALAPPDATA%\warframe-companion\`
 - **WFM session token** — stored in Windows Credential Manager if "Stay logged in" is enabled; your password is never saved
 - **Warframe.market requests** are made from your machine directly to warframe.market (same as visiting in a browser)
 
