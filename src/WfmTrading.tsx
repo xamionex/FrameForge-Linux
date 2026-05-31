@@ -36,7 +36,7 @@ function fmt(n: number) { return n.toLocaleString(); }
 
 /** Debug helper: call from browser console via window.__wfmDump('/v2/orders/my') */
 if (typeof window !== "undefined") {
-  (window as Record<string, unknown>).__wfmDump = async (path: string) => {
+  (window as unknown as Record<string, unknown>).__wfmDump = async (path: string) => {
     const result = await invoke<string>("wfm_debug_dump", { path }).catch(e => String(e));
     console.log(result);
     return result;
@@ -139,7 +139,7 @@ function LoginPanel({ onLogin }: { onLogin: (u: string) => void }) {
 
 // ── Listings panel ────────────────────────────────────────────────────────────
 
-function ListingsPanel({ username, itemIdMap }: { username: string; itemIdMap: Map<string, string> }) {
+function ListingsPanel({ itemIdMap }: { username: string; itemIdMap: Map<string, string> }) {
   const [orders, setOrders] = useState<{ sell: WfmOrder[]; buy: WfmOrder[] }>({ sell: [], buy: [] });
   const [loading, setLoading] = useState(true);
   const [editId, setEditId]   = useState<string | null>(null);
@@ -196,7 +196,7 @@ function ListingsPanel({ username, itemIdMap }: { username: string; itemIdMap: M
                ?? o.item?.urlName
                ?? o.item?.url_name
                ?? (o.item?.slug ? (o.item.slug as string).replace(/_/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()) : null)
-               ?? ((o as Record<string, unknown>).itemId ? itemIdMap.get((o as Record<string, unknown>).itemId as string) : null)
+               ?? ((o as unknown as Record<string, unknown>).itemId ? itemIdMap.get((o as unknown as Record<string, unknown>).itemId as string) : null)
                ?? "—"
              }</span>
              {editId === o.id ? (
@@ -226,7 +226,7 @@ function ListingsPanel({ username, itemIdMap }: { username: string; itemIdMap: M
 
 // ── Messages panel ────────────────────────────────────────────────────────────
 
-function MessagesPanel({ username }: { username: string }) {
+function MessagesPanel({ username: _username }: { username: string }) {
   const [whispers, setWhispers] = useState<WfmWhisper[]>([]);
   const [copied, setCopied]     = useState<string | null>(null);
   const bottomRef               = useRef<HTMLDivElement>(null);
@@ -305,7 +305,7 @@ function MessagesPanel({ username }: { username: string }) {
 
 // ── Main export ───────────────────────────────────────────────────────────────
 
-export default function WfmTrading({ wfmLookup, wfmItems, quantities, onNewWhisper, onLoginChange }: Props) {
+export default function WfmTrading({ wfmLookup: _wfmLookup, wfmItems, quantities: _quantities, onNewWhisper, onLoginChange }: Props) {
   const [tab, setTab]           = useState<"listings" | "messages">("listings");
   const [username, setUsername]         = useState<string | null>(null);
   const [checking, setChecking]         = useState(true);

@@ -15,7 +15,7 @@ interface CatalogItem {
   ducats?: number | null;
 }
 
-interface WfmItem { item_name: string; url_name: string; }
+interface WfmItem { id: string; item_name: string; url_name: string; }
 interface WfmPrice { url_name: string; sell_median?: number; }
 
 interface CraftingJob { unique_name: string; item_name: string; completion_ms: number; }

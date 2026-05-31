@@ -149,7 +149,7 @@ function CreateOrderForm({ urlName, prefillPrice, prefillType, onDone }: {
 
 // ── Main popup ────────────────────────────────────────────────────────────────
 
-export default function ItemMarketPopup({ urlName, displayName, imageName, onClose, isLoggedIn, myUsername }: Props) {
+export default function ItemMarketPopup({ urlName, displayName, imageName, onClose, isLoggedIn }: Props) {
   const [orders, setOrders]     = useState<{ sell: WfmOrder[]; buy: WfmOrder[] } | null>(null);
   const [stats, setStats]       = useState<StatPoint[]>([]);
   const [loadingO, setLoadingO] = useState(true);
