@@ -1,4 +1,4 @@
-# FrameForge — Warframe Companion `v1.4.0`
+# FrameForge — Warframe Companion `v1.4.1`
 
 A desktop companion for Warframe that shows your live inventory, tracks crafting recipes, displays market prices, runs a full trading desk, manages a live timer dashboard, and auto-detects relic reward screens — all without modifying the game.
 
@@ -47,6 +47,9 @@ A live dashboard fetching data directly from DE's official Warframe worldstate:
 
 Any timer can be pinned to the Modular Window for at-a-glance viewing.
 
+### Warframe Companion API — Optional & Opt-In
+The connection to `api.warframe.com/api/inventory.php` (which adds mod ranks and detailed inventory data) is **disabled by default**. It can be enabled in Settings under "Warframe Companion API" with a clear warning. We are awaiting official clarification from Digital Extremes on whether this endpoint is permitted for community tools. The app works fully without it — all core features use the read-only memory scanner only.
+
 ### Statistics — Trade Tracker & Reports
 A full trade history and analytics dashboard, automatically populated from your activity:
 
@@ -54,7 +57,8 @@ A full trade history and analytics dashboard, automatically populated from your 
 - Every in-game trade is detected automatically from `EE.log` the moment "The trade was successful!" appears — no button to press
 - WFM trades are logged automatically when you click **✓ Sold** in the Messages tab
 - Manual entry form for trades made outside of FrameForge
-- Each trade records: item name (with mod rank e.g. `Ammo Case (R0)`), quantity, platinum, trading partner, direction, source, and timestamp
+- Each trade records: item name with rank (mods use text suffix e.g. `Ammo Case (R0)`; arcanes use Unicode rank dots decoded from the log e.g. `Arcane Agility (R4)`), quantity, platinum total, trading partner, direction, source, and timestamp
+- Trades with multiple different items are recorded as a comma-separated list
 
 **Reports tab:**
 - Date range filter: Today / 7 Days / 30 Days / 90 Days / YTD / 1 Year / All Time

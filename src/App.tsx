@@ -284,6 +284,7 @@ export default function App() {
   const [masteryRank, setMasteryRank] = useState<number | null>(null);
   const [masteryData, setMasteryData] = useState<Record<string, number>>({});
   const [wfConnected, setWfConnected] = useState(false);
+  const [companionApiEnabled, setCompanionApiEnabled] = useState(false);
   const [overlayStatus, setOverlayStatus] = useState("");
   const [subsummedWarframes, setSubsummedWarframes] = useState<Set<string>>(new Set());
   const [archonShards, setArchonShards] = useState<Record<string, {type: string; tauforged: boolean; color: string; boost?: string}[]>>({});
@@ -348,11 +349,11 @@ export default function App() {
   // Refs so we can read the latest state in the save callback without stale closures
   const settingsLoadedRef = useRef(false);
   const settingsRef = useRef({
-    overlayEnabled: true, overlayPriority: "completion", textScale: 1, colorblindMode: false,
+    overlayEnabled: true, overlayPriority: "completion", textScale: 1, colorblindMode: false, companionApiEnabled: false,
     tracked: [] as string[], favorites: [] as string[], timerFavorites: [] as string[], fissureWatches: [] as FissureWatch[], modularWidth: 240,
     modularSectionOrder: ["tracking", "favorites", "timers"] as string[], modularPopout: false,
   });
-  settingsRef.current = { overlayEnabled, overlayPriority, textScale, colorblindMode, tracked, favorites, timerFavorites, fissureWatches, modularWidth, modularSectionOrder, modularPopout };
+  settingsRef.current = { overlayEnabled, overlayPriority, textScale, colorblindMode, companionApiEnabled, tracked, favorites, timerFavorites, fissureWatches, modularWidth, modularSectionOrder, modularPopout };
 
   const saveAllSettings = useCallback(() => {
     invoke("save_settings", { json: JSON.stringify(settingsRef.current) }).catch(() => {});
@@ -386,6 +387,7 @@ export default function App() {
       if (!json) return;
       try {
         const s = JSON.parse(json);
+        if (typeof s.companionApiEnabled === "boolean") setCompanionApiEnabled(s.companionApiEnabled);
         if (typeof s.overlayEnabled === "boolean") {
           setOverlayEnabled(s.overlayEnabled);
           localStorage.setItem("ff-overlay-enabled", String(s.overlayEnabled));
@@ -816,6 +818,11 @@ export default function App() {
   // ── Auto-refresh API: 8 s while connecting, 30 s once connected ─────────
 
   useEffect(() => {
+    if (!companionApiEnabled) {
+      setWfConnected(false);
+      wfConnectedRef.current = false;
+      return;
+    }
     let cancelled = false;
     let timeoutId: ReturnType<typeof setTimeout>;
 
@@ -858,7 +865,7 @@ export default function App() {
 
     doFetch();
     return () => { cancelled = true; clearTimeout(timeoutId); };
-  }, [applyInventoryData]);
+  }, [applyInventoryData, companionApiEnabled]); // eslint-disable-line
 
   // ── Relic reward overlay ──────────────────────────────────────────────────
   useEffect(() => {
@@ -1108,7 +1115,7 @@ export default function App() {
           {wfConnected && lastApiRefresh && (
             <span className="api-badge" title="Warframe API — auto-refreshes every 30s">⚡ API {timeStr(lastApiRefresh)}</span>
           )}
-          {!wfConnected && warframeRunning && (
+          {!wfConnected && warframeRunning && companionApiEnabled && (
             <span
               className="api-badge"
               style={{ color: "var(--muted)", cursor: "pointer" }}
@@ -1265,8 +1272,39 @@ export default function App() {
                 </div>
               </div>
 
+              {/* ── Companion API toggle ── */}
+              <div className="settings-section" style={{ borderColor: companionApiEnabled ? "rgba(240,192,64,.3)" : undefined }}>
+                <div className="settings-section-title" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  Warframe Companion API
+                  <span style={{ fontSize: 10, background: "rgba(240,192,64,.15)", color: "#f0c040", border: "1px solid rgba(240,192,64,.35)", borderRadius: 3, padding: "1px 6px", fontWeight: 700 }}>
+                    UNOFFICIAL
+                  </span>
+                </div>
+                <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 10, lineHeight: 1.6 }}>
+                  Connects to <code style={{ fontSize: 10 }}>api.warframe.com/api/inventory.php</code> to add mod ranks and extra inventory detail.
+                  DE has not officially confirmed this is permitted for third-party tools.
+                  The app works fully without it — memory scanning handles all core inventory.
+                </div>
+                <div style={{ background: "rgba(240,192,64,.07)", border: "1px solid rgba(240,192,64,.25)", borderRadius: 5, padding: "8px 10px", marginBottom: 10, fontSize: 11, color: "#f0c040", lineHeight: 1.5 }}>
+                  ⚠ Enabling this is at your own risk. We are awaiting official clarification from Digital Extremes.
+                </div>
+                <div className="settings-row">
+                  <div>
+                    <span className="settings-row-label">Enable Companion API</span>
+                    <span className="settings-row-desc">Adds mod ranks and detailed inventory data</span>
+                  </div>
+                  <button
+                    className="btn-secondary"
+                    style={{ minWidth: 64, background: companionApiEnabled ? "rgba(240,192,64,.15)" : undefined, borderColor: companionApiEnabled ? "#f0c040" : undefined, color: companionApiEnabled ? "#f0c040" : undefined }}
+                    onClick={() => { const next = !companionApiEnabled; setCompanionApiEnabled(next); saveAllSettings(); }}
+                  >
+                    {companionApiEnabled ? "Enabled" : "Disabled"}
+                  </button>
+                </div>
+              </div>
+
               {/* ── Account ── */}
-              <div className="settings-section">
+              <div className="settings-section" style={{ opacity: companionApiEnabled ? 1 : 0.4, pointerEvents: companionApiEnabled ? "auto" : "none" }}>
                 <div className="settings-section-title" style={{ display: "flex", alignItems: "center", gap: 8 }}>
                   Manual Account Connection
                   <HelpTip items={[

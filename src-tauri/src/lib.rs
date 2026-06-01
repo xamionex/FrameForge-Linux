@@ -1920,37 +1920,65 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                         let plat_offered  = parse_plat(&offered);
                         let plat_received = parse_plat(&received);
 
-                        // Extract item name + rank and count quantity.
-                        // EE.log format: "Item Name (RARITY RANK N)" — kept as "Item Name (RN)"
-                        // so rank is visible in the trade history.
-                        let extract_item_and_qty = |section: &str| -> (String, i64) {
-                            let first = section.lines().find(|l| {
-                                let t = l.trim();
-                                !t.is_empty() && !t.to_lowercase().contains("platinum")
-                            });
-                            let full_name = first.map(|l| {
-                                let l = l.trim();
-                                if let Some(p) = l.find(" (") {
-                                    let inside = &l[p+2..];
-                                    let ll = inside.to_lowercase();
-                                    if let Some(r) = ll.find("rank ") {
-                                        let rank_n = inside[r+5..].trim_end_matches(')').trim();
-                                        format!("{} (R{})", &l[..p], rank_n)
-                                    } else {
-                                        l[..p].trim().to_string()
-                                    }
+                        // Warframe encodes item ranks as Unicode Private Use Area dots:
+                        //   U+E114 (bytes EE 84 94) = filled dot = one acquired rank level
+                        //   U+E112 (bytes EE 84 92) = empty dot  = unacquired rank level
+                        // Count filled dots to get actual rank.
+                        // Mods use text suffix " (COMMON RANK N)" instead.
+                        let clean_item_line = |l: &str| -> String {
+                            let l = l.trim();
+                            // Check for Warframe PUA rank dots (arcanes, some items)
+                            let filled = l.chars().filter(|&c| c == '\u{E114}').count();
+                            let total  = l.chars().filter(|&c| c == '\u{E114}' || c == '\u{E112}').count();
+                            if total > 0 {
+                                // Strip the PUA characters to get the base name
+                                let base: String = l.chars()
+                                    .take_while(|&c| c != '\u{E114}' && c != '\u{E112}')
+                                    .collect::<String>();
+                                let base = base.trim();
+                                return if filled == 0 && total > 0 {
+                                    // All empty dots = rank 0 — omit rank suffix for cleanliness
+                                    // OR include it for completeness. We include it so R0 is explicit.
+                                    format!("{} (R0)", base)
                                 } else {
-                                    l.to_string()
+                                    format!("{} (R{})", base, filled)
+                                };
+                            }
+                            // Check for mod text rank suffix " (RARITY RANK N)"
+                            if let Some(p) = l.find(" (") {
+                                let inside = &l[p+2..];
+                                if let Some(r) = inside.to_lowercase().find("rank ") {
+                                    let rank_n = inside[r+5..].trim_end_matches(')').trim();
+                                    return format!("{} (R{})", &l[..p], rank_n);
                                 }
-                            }).unwrap_or_default();
-                            // Base name (before rank) for counting repeated lines
-                            let base = full_name.find(" (R").map(|i| &full_name[..i]).unwrap_or(&full_name);
-                            let qty = if base.is_empty() { 0 } else {
-                                section.lines()
-                                    .filter(|l| l.to_lowercase().contains(&base.to_lowercase()))
-                                    .count() as i64
-                            };
-                            (full_name, qty.max(1))
+                                return l[..p].trim().to_string();
+                            }
+                            l.to_string()
+                        };
+
+                        let extract_item_and_qty = |section: &str| -> (String, i64) {
+                            let items: Vec<String> = section.lines()
+                                .filter(|l| {
+                                    let t = l.trim();
+                                    !t.is_empty() && !t.to_lowercase().contains("platinum")
+                                })
+                                .map(|l| clean_item_line(l))
+                                .filter(|s| !s.is_empty())
+                                .collect();
+
+                            if items.is_empty() { return (String::new(), 1); }
+
+                            let qty = items.len() as i64;
+                            let first = &items[0];
+                            let all_same = items.iter().all(|i| i == first);
+
+                            if all_same {
+                                // 6× same item → "Neo R1 Relic", qty 6
+                                (first.clone(), qty)
+                            } else {
+                                // Mixed items → join them, qty = total count
+                                (items.join(", "), qty)
+                            }
                         };
 
                         // Determine direction, item, quantity, platinum

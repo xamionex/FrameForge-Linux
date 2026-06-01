@@ -35,7 +35,7 @@ function PlatChart({ trades }: { trades: Trade[] }) {
   const byDay = new Map<string, number>();
   [...trades].reverse().forEach(t => {
     const day = t.timestamp.slice(0, 10);
-    const delta = t.direction === "sold" ? t.platinum * t.quantity : -t.platinum * t.quantity;
+    const delta = t.direction === "sold" ? t.platinum : -t.platinum;
     byDay.set(day, (byDay.get(day) ?? 0) + delta);
   });
 
@@ -191,8 +191,8 @@ function TradesTab() {
     t.with_player.toLowerCase().includes(filter.toLowerCase())
   );
 
-  const totalSold   = trades.filter(t => t.direction === "sold").reduce((s, t) => s + t.platinum * t.quantity, 0);
-  const totalBought = trades.filter(t => t.direction === "bought").reduce((s, t) => s + t.platinum * t.quantity, 0);
+  const totalSold   = trades.filter(t => t.direction === "sold").reduce((s, t) => s + t.platinum, 0);
+  const totalBought = trades.filter(t => t.direction === "bought").reduce((s, t) => s + t.platinum, 0);
   const net         = totalSold - totalBought;
 
   return (
@@ -249,7 +249,7 @@ function TradesTab() {
               </div>
               <div className="stat-trade-meta">
                 <span className={`stat-trade-plat ${t.direction}`}>
-                  {t.direction === "sold" ? "+" : "-"}{fmt(t.platinum * t.quantity)}p
+                  {t.direction === "sold" ? "+" : "-"}{fmt(t.platinum)}p
                 </span>
                 {t.quantity > 1 && <span className="stat-trade-qty">×{t.quantity}</span>}
               </div>
@@ -312,8 +312,8 @@ function ReportsTab() {
 
   const sold   = trades.filter(t => t.direction === "sold");
   const bought = trades.filter(t => t.direction === "bought");
-  const totalEarned  = sold.reduce((s, t) => s + t.platinum * t.quantity, 0);
-  const totalSpent   = bought.reduce((s, t) => s + t.platinum * t.quantity, 0);
+  const totalEarned  = sold.reduce((s, t) => s + t.platinum, 0);
+  const totalSpent   = bought.reduce((s, t) => s + t.platinum, 0);
   const net          = totalEarned - totalSpent;
 
   // ── Per-item analytics ───────────────────────────────────────────────────
@@ -323,11 +323,11 @@ function ReportsTab() {
     const cur = itemMap.get(key) ?? { sold: 0, bought: 0, platEarned: 0, platSpent: 0, prices: [] };
     if (t.direction === "sold") {
       cur.sold     += t.quantity;
-      cur.platEarned += t.platinum * t.quantity;
+      cur.platEarned += t.platinum;
       cur.prices.push(t.platinum);
     } else {
       cur.bought   += t.quantity;
-      cur.platSpent += t.platinum * t.quantity;
+      cur.platSpent += t.platinum;
     }
     itemMap.set(key, cur);
   });
@@ -346,7 +346,7 @@ function ReportsTab() {
   trades.filter(t => t.with_player).forEach(t => {
     const cur = partnerMap.get(t.with_player) ?? { trades: 0, platExchanged: 0 };
     cur.trades += 1;
-    cur.platExchanged += t.platinum * t.quantity;
+    cur.platExchanged += t.platinum;
     partnerMap.set(t.with_player, cur);
   });
   const partnerRows = [...partnerMap.entries()]
@@ -358,7 +358,7 @@ function ReportsTab() {
   const dailyMap = new Map<string, number>();
   [...trades].reverse().forEach(t => {
     const day = t.timestamp.slice(0, 10);
-    const delta = t.direction === "sold" ? t.platinum * t.quantity : -t.platinum * t.quantity;
+    const delta = t.direction === "sold" ? t.platinum : -t.platinum;
     dailyMap.set(day, (dailyMap.get(day) ?? 0) + delta);
   });
   const dailyPoints = [...dailyMap.entries()].sort((a, b) => a[0].localeCompare(b[0]));
