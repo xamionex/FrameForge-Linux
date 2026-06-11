@@ -29,6 +29,15 @@ native-tls = "0.2"
 whirlpool = "0.10"
 lzma-rs = "0.3"
 
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+tesseract = "0.15"
+xcap = "0.9"
+image = "0.25"
+raw-window-handle = "0.6"
+# Matches the gtk version Tauri/tao already pull in (0.18.x); used to set
+# focus_on_map(false) on the overlay window so it never grabs focus on map.
+gtk = "0.18"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = [
     "Win32_Foundation",

@@ -2,143 +2,12 @@ import { useState, useEffect, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import {
+  buildLocalRewards, fetchRewardPrices, shortName, bestPickIndex,
+  type PickPriority, type CraftingJobTs, type RewardItem,
+} from "./rewardData";
 
 import "./Overlay.css";
-
-export type PickPriority = "completion" | "plat" | "ducat" | "setPlat";
-
-interface ComponentRow {
-  unique_name: string;
-  name: string;
-  needed: number;
-  owned: number;  // blueprint_qty + built_qty + crafting_qty combined
-  plat?: number;
-  ducats?: number;
-}
-
-interface CraftingJobTs {
-  unique_name: string;
-  item_name: string;
-  completion_ms: number;
-}
-
-interface RewardItem {
-  unique_name: string;
-  raw_unique: string;
-  slot_x: number;
-  name: string;
-  category?: string;
-  vaulted?: boolean;
-  plat?: number;
-  ducats?: number;
-  owned_qty?: number;
-  set_name?: string;
-  components?: ComponentRow[];
-  complete_sets?: number;
-  missing_plat?: number;
-  total_plat?: number;   // sum of all component prices × needed qty
-}
-
-// ─── Set-name derivation ──────────────────────────────────────────────────────
-const WF_COMP_SUFF = [' Neuroptics Blueprint', ' Chassis Blueprint', ' Systems Blueprint'];
-const PART_SUFF = [
-  ' Upper Limb', ' Lower Limb', ' Receiver', ' Barrel', ' Stock',
-  ' Blade', ' Handle', ' Guard', ' Hilt', ' Link', ' Gauntlet',
-  ' Carapace', ' Cerebrum', ' Systems', ' Head', ' Strike', ' Boot',
-  ' String', ' Disc', ' Neuroptics', ' Chassis', ' Stars',
-];
-
-function getSetName(itemName: string): string | null {
-  for (const s of WF_COMP_SUFF) if (itemName.endsWith(s)) return itemName.slice(0, -s.length);
-  for (const s of PART_SUFF)    if (itemName.endsWith(s)) return itemName.slice(0, -s.length);
-  if (itemName.endsWith(' Blueprint')) {
-    const base = itemName.slice(0, -' Blueprint'.length);
-    for (const s of PART_SUFF) if (base.endsWith(s)) return base.slice(0, -s.length);
-    return base;
-  }
-  return null;
-}
-
-function shortName(fullName: string, setName: string): string {
-  return fullName.startsWith(setName + ' ') ? fullName.slice(setName.length + 1) : fullName;
-}
-
-// ─── Ownership resolver ───────────────────────────────────────────────────────
-// Pure function — no closure captures, takes explicit snapshots of qty/crafting.
-// Counts the total available copies of a component:
-//   directQty  = inventory qty matched by catalog WFCD path
-//   altQty     = qty of the complementary form (blueprint ↔ built sub-part)
-//   craftQty   = active Foundry jobs for either form
-function resolveOwnedFn(
-  uniqueName: string,
-  displayName: string,
-  cat: Record<string, any>,
-  qty: Record<string, number>,
-  crafting: Record<string, number>,
-): number {
-  const clk = uniqueName.replace("/Lotus/StoreItems/", "/Lotus/");
-  const catEntry = cat[clk] ?? cat[uniqueName]
-    ?? (Object.values(cat).find((it: any) => it.name === displayName) as any);
-  const catClk = catEntry
-    ? (catEntry.unique_name as string).replace("/Lotus/StoreItems/", "/Lotus/")
-    : clk;
-  const directQty = qty[catClk] ?? qty[clk] ?? qty[uniqueName] ?? 0;
-
-  let altQty = 0;
-  let altClk: string | null = null;
-  if (displayName.endsWith(' Blueprint')) {
-    const partName = displayName.slice(0, -' Blueprint'.length);
-    const partEntry = Object.values(cat).find(
-      (it: any) => it.name === partName && it.category === 'Parts'
-    ) as any;
-    if (partEntry) {
-      altClk = (partEntry.unique_name as string).replace("/Lotus/StoreItems/", "/Lotus/");
-      altQty = qty[altClk] ?? qty[partEntry.unique_name] ?? 0;
-    }
-  } else {
-    const bpName = displayName + ' Blueprint';
-    const bpEntry = Object.values(cat).find(
-      (it: any) => it.name === bpName && it.category === 'Blueprints'
-    ) as any;
-    if (bpEntry) {
-      altClk = (bpEntry.unique_name as string).replace("/Lotus/StoreItems/", "/Lotus/");
-      altQty = qty[altClk] ?? qty[bpEntry.unique_name] ?? 0;
-    }
-  }
-
-  const craftQty = crafting[catClk] ?? crafting[clk] ?? crafting[uniqueName]
-    ?? (altClk ? (crafting[altClk] ?? 0) : 0);
-
-  return directQty + altQty + craftQty;
-}
-
-// ─── Best-pick calculation ────────────────────────────────────────────────────
-function bestPickIndex(items: RewardItem[], priority: PickPriority): number {
-  if (items.length === 0) return -1;
-
-  const scores = items.map(item => {
-    switch (priority) {
-      case "plat":    return item.plat ?? 0;
-      case "ducat":   return item.ducats ?? 0;
-      case "setPlat": return item.missing_plat ?? item.plat ?? 0;
-      case "completion": {
-        if (!item.components || !item.set_name) return item.plat ?? 0;
-        const sn = item.set_name;
-        const sn_short = shortName(item.name, sn);
-        const thisComp = item.components.find(c => shortName(c.name, sn) === sn_short);
-        if (!thisComp) return 0;
-        const stillNeed = thisComp.needed - thisComp.owned;
-        if (stillNeed <= 0) return -1;
-        const totalNeeded = item.components.reduce((a, c) => a + Math.max(0, c.needed - c.owned), 0);
-        return stillNeed * 100 - totalNeeded;
-      }
-    }
-  });
-
-  let best = 0;
-  for (let i = 1; i < scores.length; i++) if ((scores[i] ?? 0) > (scores[best] ?? 0)) best = i;
-  return (scores[best] ?? 0) > 0 ? best : -1;
-}
 
 // ─── Icons ────────────────────────────────────────────────────────────────────
 function PlatIcon({ size = 14 }: { size?: number }) {
@@ -159,7 +28,7 @@ function PickArrow({ slotX, winW }: { slotX: number; winW: number }) {
 }
 
 // ─── Reward card ──────────────────────────────────────────────────────────────
-function RewardCard({ item, left, width }: { item: RewardItem; left: number; width: number }) {
+function RewardCard({ item, left, width, scannerEnabled }: { item: RewardItem; left: number; width: number; scannerEnabled: boolean }) {
   const hasSet    = !!item.components;
   const ownedFull = (item.complete_sets ?? 0) >= 1;
 
@@ -184,8 +53,8 @@ function RewardCard({ item, left, width }: { item: RewardItem; left: number; wid
         </span>
       </div>
 
-      {/* Set section — only when recipe data is available */}
-      {hasSet && <>
+      {/* Set section — only when recipe data is available AND memory scanner is on */}
+      {hasSet && scannerEnabled && <>
         {/* Ownership status bar */}
         <div className={`ov-own-bar ${ownedFull ? 'ov-own-yes' : 'ov-own-no'}`}>
           {ownedFull ? 'Full Item Owned' : 'Full Item Not Owned'}
@@ -228,6 +97,10 @@ export default function Overlay() {
   const params   = new URLSearchParams(window.location.search);
   const winW     = parseInt(params.get("ww") ?? "1920", 10);
   const priority = (params.get("priority") ?? "completion") as PickPriority;
+  const scannerEnabled = (params.get("scanner") ?? "on") === "on";
+  // In-game UI scale (fraction). Cards shrink and cluster toward centre at lower
+  // scales, so the column spacing and width scale with it. Clamped to a sane range.
+  const uiScale  = Math.min(1, Math.max(0.5, parseFloat(params.get("uiscale") ?? "1") || 1));
 
   const prevKey      = useRef<string>("");
   const catalogRef   = useRef<Record<string, any>>({});
@@ -245,12 +118,73 @@ export default function Overlay() {
     important(document.getElementById('root'));
   }, []);
 
+  // Subprocess mode: read the payload directly from the temp file (Tauri events
+  // don't cross process boundaries). The overlay process has no AppState, so it
+  // can't resolve items itself — the MAIN process pre-enriches them and ships the
+  // finished RewardItem[] in the payload's `rewards`. We render those instantly,
+  // then poll the enrichment file for the price-filled version the main process
+  // writes a moment later (warframe.market lookups are rate-limited).
   useEffect(() => {
-    type EventPayload = { paths: string[]; positions: number[] };
+    // Subprocess mode only. The `payload` URL param marks this as the spawned
+    // overlay process (the in-process Windows native window doesn't set it and
+    // resolves via its own real invoke handler through the second effect below).
+    const payloadPath = params.get("payload");
+    if (!payloadPath) return;
+
+    let cancelled = false;
+    let pollTimer: ReturnType<typeof setInterval> | undefined;
+
+    // The webview cannot fetch file:// under WebKitGTK (blocked from the app
+    // origin), so the overlay subprocess exposes read_overlay_payload /
+    // read_overlay_enriched commands that read the temp files in Rust and return
+    // the parsed JSON. They resolve null while a file is still absent.
+    invoke<any>("read_overlay_payload")
+      .then((data: any) => {
+        if (cancelled || !data) return;
+        if (Array.isArray(data.rewards) && data.rewards.length > 0) {
+          // Pre-enriched by the main process — render immediately.
+          prevKey.current = (data.items ?? []).join(",");
+          setRewards(data.rewards);
+          // Keep polling the enrichment file for the overlay's lifetime: the main
+          // process writes both price fills AND repeat-scan refinements (the
+          // majority-vote re-reads) here. Apply whenever the content changes,
+          // rather than stopping after the first read. Seed with the initial set so
+          // an identical first enriched read doesn't trigger a redundant re-render.
+          let lastEnriched = JSON.stringify(data.rewards);
+          pollTimer = setInterval(() => {
+            invoke<any>("read_overlay_enriched")
+              .then((priced: any) => {
+                if (cancelled || !Array.isArray(priced) || priced.length === 0) return;
+                const key = JSON.stringify(priced);
+                if (key === lastEnriched) return;
+                lastEnriched = key;
+                setRewards(priced);
+              })
+              .catch(() => {});
+          }, 400);
+        } else if (data.items && data.items.length > 0) {
+          // Legacy / in-process (Windows) path: enrich here via invoke.
+          const synthetic = new CustomEvent("relic-rewards-payload", {
+            detail: { items: data.items, positions: data.positions, names: data.names },
+          });
+          window.dispatchEvent(synthetic);
+        }
+      })
+      .catch(() => {});
+
+    return () => { cancelled = true; if (pollTimer) clearInterval(pollTimer); };
+  }, []);
+
+  useEffect(() => {
+    type EventPayload = { paths: string[]; positions: number[]; names?: string[] };
     let pendingEvent: EventPayload | null = null;
     let dataReady = false;
 
-    const processPayload = (paths: string[], positions: number[]) => {
+    // In-process enrichment path (Windows native window, or any case where the
+    // payload arrived without pre-resolved rewards). Here invoke() reaches the
+    // real AppState, so we resolve locally then layer prices on — the same shared
+    // resolver the main process uses for the Linux subprocess.
+    const processPayload = async (paths: string[], positions: number[], names?: string[]) => {
       const key = paths.join(",");
       if (key === prevKey.current) return;
 
@@ -259,140 +193,31 @@ export default function Overlay() {
 
       prevKey.current = key;
 
-      const byUnique = catalogRef.current;
-      const qty      = quantRef.current;
-      const base: RewardItem[] = paths.map((path, i) => {
-        const lk   = path.replace("/Lotus/StoreItems/", "/Lotus/");
-        const meta = byUnique[lk] ?? byUnique[path];
-        return {
-          unique_name: path + "-" + i,
-          raw_unique: lk,
-          slot_x: positions[i] ?? 0.5,
-          name:      meta?.name    ?? path.split("/").pop() ?? path,
-          category:  meta?.category,
-          vaulted:   meta?.vaulted,
-          ducats:    meta?.ducats,
-          owned_qty: qty[lk] ?? qty[path] ?? 0,
-        };
-      });
-      setRewards(base);
+      // Refresh quantities from the latest memory scan before rendering.
+      // The overlay can open before the monitor thread has populated
+      // current_quantities, so the initial mount-time fetch may be stale.
+      try {
+        quantRef.current = await invoke<Record<string, number>>("get_current_quantities");
+      } catch { /* keep existing */ }
 
-      paths.forEach(async (path, i) => {
-        const lk   = path.replace("/Lotus/StoreItems/", "/Lotus/");
-        const meta = byUnique[lk] ?? byUnique[path];
-        const name = meta?.name ?? path.split("/").pop() ?? path;
+      const local = await buildLocalRewards(
+        paths, positions, catalogRef.current, quantRef.current, craftingRef.current, names,
+      );
+      setRewards(local);
 
-        invoke<number | null>("get_item_price", { itemName: name })
-          .then(plat => { if (plat != null) setRewards(prev => prev.map((r, idx) => idx === i ? { ...r, plat } : r)); })
+      // `local` already carries plat from the bulk snapshot. Only hit the live,
+      // rate-limited warframe.market path to fill snapshot MISSES (null plat).
+      const hasMiss = local.some(r =>
+        r.plat == null || (r.components?.some(c => c.plat == null) ?? false));
+      if (hasMiss) {
+        fetchRewardPrices(local)
+          .then(priced => { if (prevKey.current === key) setRewards(priced); })
           .catch(() => {});
-
-        const setName = getSetName(name);
-        if (!setName) return;
-
-        // Read the catalog once for this card's async chain; quantities are read
-        // from quantRef.current AFTER the recipe await so they reflect any
-        // inventory-update that fired while we were waiting.
-        const cat       = catalogRef.current;
-        const setPrefix = setName + " ";
-
-        type RC = { unique_name: string; name: string; count: number; result_count: number };
-        let components: ComponentRow[] | null = null;
-
-        // The "built item" entry (weapon/warframe entity, not blueprint or part).
-        const setEntry = Object.values(cat).find(item =>
-          item.name === setName &&
-          item.category !== 'Blueprints' &&
-          item.category !== 'Parts'
-        );
-
-        // Attempt 1: recipe lookup (gives exact ingredient list + correct needed counts)
-        if (setEntry) {
-          const recipe = await invoke<RC[]>("get_recipe", { unique_name: setEntry.unique_name }).catch(() => []);
-          if (recipe.length) {
-            // Filter out raw resources (Rubedo, Circuits etc.) — show only craftable parts
-            const parts = recipe.filter(c => {
-              const clk = c.unique_name.replace("/Lotus/StoreItems/", "/Lotus/");
-              const cm  = cat[clk] ?? cat[c.unique_name];
-              return cm?.category === 'Parts' || cm?.category === 'Blueprints';
-            });
-            if (parts.length >= 1) {
-              // Read quantities AFTER the recipe await — scanner may have committed
-              // items to current_quantities during the async gap.
-              const liveQty = quantRef.current;
-              const liveCraft = craftingRef.current;
-              components = parts.map(c => {
-                const clk = c.unique_name.replace("/Lotus/StoreItems/", "/Lotus/");
-                const cm  = cat[clk] ?? cat[c.unique_name];
-                return {
-                  unique_name: c.unique_name,
-                  name:        c.name,
-                  needed:      c.count ?? 1,
-                  owned:       resolveOwnedFn(c.unique_name, c.name, cat, liveQty, liveCraft),
-                  ducats:      cm?.ducats,
-                };
-              });
-            }
-          }
-        }
-
-        // Attempt 2: catalog prefix search — works even when recipe cache is empty.
-        // Needed count defaults to 1 (imprecise for parts that require 2, but better than nothing).
-        if (!components) {
-          const liveQty   = quantRef.current;
-          const liveCraft = craftingRef.current;
-          const parts = Object.values(cat)
-            .filter((item: any) => item.name?.startsWith(setPrefix) &&
-                            (item.category === 'Parts' || item.category === 'Blueprints'))
-            .map((item: any) => ({
-              unique_name: item.unique_name,
-              name:        item.name as string,
-              needed:      1,
-              owned:       resolveOwnedFn(item.unique_name, item.name as string, cat, liveQty, liveCraft),
-              ducats:      item.ducats as number | undefined,
-            }));
-          if (parts.length >= 2) components = parts;
-        }
-
-        if (!components) return;
-
-        // "Owned" = user has enough components to build, OR already built the item.
-        const liveQty  = quantRef.current;
-        const compSets = components.length > 0
-          ? Math.floor(Math.min(...components.map(c => c.owned / c.needed)))
-          : 0;
-        const builtLk  = (setEntry?.unique_name ?? '').replace("/Lotus/StoreItems/", "/Lotus/");
-        const builtQty = setEntry
-          ? (liveQty[builtLk] ?? liveQty[setEntry.unique_name] ?? 0)
-          : 0;
-        const completeSets = builtQty > 0 ? Math.max(compSets, 1) : compSets;
-
-        setRewards(prev => prev.map((r, idx) => idx === i
-          ? { ...r, set_name: setName, components: components!, complete_sets: completeSets, missing_plat: 0, total_plat: 0 }
-          : r
-        ));
-
-        await Promise.all(components.map(async comp => {
-          const plat = await invoke<number | null>("get_item_price", { itemName: comp.name }).catch(() => null);
-          if (plat == null) return;
-          setRewards(prev => prev.map((r, idx) => {
-            if (idx !== i || !r.components) return r;
-            const comps = r.components.map(c =>
-              c.unique_name === comp.unique_name ? { ...c, plat } : c
-            );
-            const missing_plat = comps.reduce((acc, c) => {
-              if (c.owned < c.needed && c.plat) return acc + c.plat * (c.needed - c.owned);
-              return acc;
-            }, 0);
-            const total_plat = comps.reduce((acc, c) =>
-              c.plat != null ? acc + c.plat * (c.needed ?? 1) : acc, 0
-            );
-            return { ...r, components: comps, missing_plat, total_plat };
-          }));
-        }));
-      });
+      }
     };
 
-    const unsub = listen<{ items: string[]; positions: number[] } | null>(
+    // Tauri event (in-process native window on KDE)
+    const unsub = listen<{ items: string[]; positions: number[]; names?: string[] } | null>(
       "relic-rewards",
       async (e) => {
         const payload = e.payload;
@@ -402,12 +227,23 @@ export default function Overlay() {
         }
 
         if (dataReady) {
-          processPayload(payload.items, payload.positions);
+          await processPayload(payload.items, payload.positions, payload.names);
         } else {
-          pendingEvent = { paths: payload.items, positions: payload.positions };
+          pendingEvent = { paths: payload.items, positions: payload.positions, names: payload.names };
         }
       }
     );
+
+    // Synthetic DOM event (subprocess mode — payload read from temp file)
+    const onSynthetic = async (e: Event) => {
+      const d = (e as CustomEvent).detail as { items: string[]; positions: number[]; names?: string[] };
+      if (dataReady) {
+        await processPayload(d.items, d.positions, d.names);
+      } else {
+        pendingEvent = { paths: d.items, positions: d.positions, names: d.names };
+      }
+    };
+    window.addEventListener("relic-rewards-payload", onSynthetic);
 
     Promise.allSettled([
       invoke<any[]>("get_all_items"),
@@ -433,58 +269,34 @@ export default function Overlay() {
       dataReady = true;
 
       if (pendingEvent) {
-        processPayload(pendingEvent.paths, pendingEvent.positions);
+        processPayload(pendingEvent.paths, pendingEvent.positions, pendingEvent.names);
         pendingEvent = null;
       }
     });
 
-    // On every inventory scan, fully recompute component owned counts AND the
-    // built-item check.  This fixes the race where processPayload ran before the
-    // scanner had committed items (all counts showed 0), and ensures warframes
-    // that appear in unique_quantities after 2+ consecutive scans flip the card.
-    const unsubInv = listen<{ quantities: Record<string, number> }>("inventory-update", (e) => {
-      const newQty = e.payload?.quantities;
-      if (!newQty) return;
-      quantRef.current = newQty;
-
-      setRewards(prev => prev.map(r => {
-        if (!r.components || !r.set_name) return r;
-
-        const cat = catalogRef.current;
-
-        // Recompute every component's owned count with the fresh quantities.
-        const updatedComponents = r.components.map(c => ({
-          ...c,
-          owned: resolveOwnedFn(c.unique_name, c.name, cat, newQty, craftingRef.current),
-        }));
-
-        const compSets = updatedComponents.length > 0
-          ? Math.floor(Math.min(...updatedComponents.map(c => c.owned / c.needed)))
-          : 0;
-
-        // Re-check whether the assembled item (warframe / weapon) is already owned.
-        const setEntry = Object.values(cat).find((item: any) =>
-          item.name === r.set_name &&
-          item.category !== 'Blueprints' &&
-          item.category !== 'Parts'
-        ) as any;
-        const builtLk  = setEntry
-          ? (setEntry.unique_name as string).replace("/Lotus/StoreItems/", "/Lotus/")
-          : '';
-        const builtQty = setEntry
-          ? (newQty[builtLk] ?? newQty[setEntry.unique_name] ?? 0)
-          : 0;
-
-        const completeSets = builtQty > 0 ? Math.max(compSets, 1) : compSets;
-
-        return { ...r, components: updatedComponents, complete_sets: completeSets };
-      }));
-    });
-
-    return () => { unsub.then(fn => fn()); unsubInv.then(fn => fn()); };
+    return () => {
+      unsub.then(fn => fn());
+      window.removeEventListener("relic-rewards-payload", onSynthetic);
+    };
   }, []);
 
-  if (rewards.length === 0) return null;
+  if (rewards.length === 0) {
+    // Diagnostic: always render something so the user can tell the overlay
+    // window is actually alive (helps debug Linux transparent-window issues).
+    // Placed at bottom-right so it never overlaps the reward text band.
+    return (
+      <div className="ov-root">
+        <div style={{
+          position: "fixed", bottom: 4, right: 4,
+          color: "#f85149", fontSize: 11, background: "rgba(0,0,0,0.7)",
+          padding: "2px 6px", borderRadius: 4, zIndex: 9999, pointerEvents: "none",
+          fontFamily: "system-ui, sans-serif", fontWeight: 700,
+        }}>
+          FrameForge Overlay — waiting for rewards…
+        </div>
+      </div>
+    );
+  }
 
   const bestIdx = bestPickIndex(rewards, priority);
 
@@ -494,9 +306,12 @@ export default function Overlay() {
   // For N cards, columns map to the game's actual slot positions:
   //   N=1: center; N=2: cols 2&3 (±0.5s); N=3: cols 1, 2.5, 4 (±1.5s and 0);
   //   N=4: cols 1-4 (±0.5s and ±1.5s).
-  const colSpacing    = winW * 0.127;
+  // Spacing and card width scale with the in-game UI scale (cards are smaller and
+  // closer together at lower scales). The symmetric ±s layout below keeps them
+  // centred, matching the game's centred reward box at any UI scale.
+  const colSpacing    = winW * 0.127 * uiScale;
   const screenCenter  = winW / 2;
-  const cardW = Math.max(80, Math.round(colSpacing - 10));
+  const cardW = Math.max(Math.round(80 * uiScale), Math.round(colSpacing - 10));
   const colCenters: number[] = (() => {
     const s = colSpacing, c = screenCenter;
     if (n === 1) return [c];
@@ -510,7 +325,7 @@ export default function Overlay() {
     <div className="ov-root">
       {bestIdx >= 0 && <PickArrow slotX={(colCenters[bestIdx] ?? screenCenter) / winW} winW={winW} />}
       {rewards.map((item, idx) => (
-        <RewardCard key={item.unique_name} item={item} left={cardLeft(idx)} width={cardW} />
+        <RewardCard key={item.unique_name} item={item} left={cardLeft(idx)} width={cardW} scannerEnabled={scannerEnabled} />
       ))}
     </div>
   );

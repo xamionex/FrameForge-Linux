@@ -8,7 +8,13 @@ import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 // Stored OUTSIDE React so StrictMode remounts don't destroy/recreate the window.
 let _rivenWin: WebviewWindow | null = null;
 let _rivenRollCount = 0;
-let _rivenLastTriggerMs = 0;
+// Bumped on every Check/New-Roll; an in-flight repeat-scan loop exits once its
+// captured cycle id no longer matches (so a new roll restarts scanning cleanly).
+let _rivenScanCycle = 0;
+// Serializes window creation so a near-simultaneous auto-open + manual trigger
+// can't both run `new WebviewWindow("riven-overlay")` (duplicate-label error).
+let _rivenCreating: Promise<void> | null = null;
+// Exposed so the "Check Riven" button can trigger from anywhere.
 let _rivenManualTrigger: (() => void) | null = null;
 export function checkRivenNow() { _rivenManualTrigger?.(); }
 
@@ -24,16 +30,24 @@ async function ensureRivenWindow(wx: number, wy: number, wh: number): Promise<{ 
   // 1. Existing valid handle
   if (_rivenWin) return { win: _rivenWin, fresh: false };
 
-  // 2. Window exists but JS lost reference (HMR, page reload)
-  const existing = await WebviewWindow.getByLabel("riven-overlay").catch(() => null);
-  if (existing) {
-    _rivenWin = existing;
-    _rivenWin.once("tauri://destroyed", () => { _rivenWin = null; });
-    return { win: _rivenWin, fresh: false };
+  // 1b. A create is already in flight (concurrent trigger) — wait for it, then reuse.
+  if (_rivenCreating) {
+    await _rivenCreating.catch(() => {});
+    return _rivenWin ? { win: _rivenWin, fresh: false } : null;
   }
 
-  // 3. Create fresh at correct position — shows immediately
+  let done!: () => void;
+  _rivenCreating = new Promise<void>(r => { done = r; });
   try {
+    // 2. Window exists but JS lost reference (HMR, page reload)
+    const existing = await WebviewWindow.getByLabel("riven-overlay").catch(() => null);
+    if (existing) {
+      _rivenWin = existing;
+      _rivenWin.once("tauri://destroyed", () => { _rivenWin = null; });
+      return { win: _rivenWin, fresh: false };
+    }
+
+    // 3. Create fresh at correct position — shows immediately
     _rivenWin = new WebviewWindow("riven-overlay", {
       url: `index.html?rivenoverlay`,
       title: "FrameForge Riven",
@@ -48,6 +62,9 @@ async function ensureRivenWindow(wx: number, wy: number, wh: number): Promise<{ 
   } catch {
     _rivenWin = null;
     return null;
+  } finally {
+    done();
+    _rivenCreating = null;
   }
 }
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -63,6 +80,7 @@ import Syndicates from "./Syndicates";
 import Overlay from "./Overlay";
 import ModularWindow from "./ModularWindow";
 import { HelpTip } from "./HelpTip";
+import { buildLocalRewards, fetchRewardPrices, type CraftingJobTs } from "./rewardData";
 import "./App.css";
 
 const _params = new URLSearchParams(window.location.search);
@@ -187,6 +205,116 @@ function deltaClass(d: number) { return d > 0 ? "delta-pos" : "delta-neg"; }
 function deltaText(d: number) { return d > 0 ? `+${fmt(d)}` : fmt(d); }
 function timeStr(ts: number) {
   return new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+// ─── Support: session log with platform-aware path ────────────────────────────
+
+function SessionLogSupport() {
+  const [logPath, setLogPath] = useState<string>("");
+  const [eePath, setEePath]   = useState<string>("");
+  const [eeInput, setEeInput] = useState<string>("");
+  const [eeMsg, setEeMsg]     = useState<string>("");
+  const [debugPath]           = useState<string>("/tmp/frameforge_main_debug.log");
+
+  const refreshEePath = () => {
+    invoke<string | null>("get_ee_log_path")
+      .then(p => {
+        const text = p ?? "Not found — overlay will not work";
+        setEePath(text);
+        setEeInput(text);
+        setEeMsg("");
+      })
+      .catch(() => setEePath("Error detecting path"));
+  };
+
+  useEffect(() => {
+    invoke<string>("get_overlay_session_log_path")
+      .then(setLogPath)
+      .catch(() => setLogPath(""));
+    refreshEePath();
+  }, []);
+
+  const saveCustomPath = async () => {
+    setEeMsg("");
+    if (!eeInput.trim()) {
+      setEeMsg("Path cannot be empty");
+      return;
+    }
+    try {
+      await invoke("set_ee_log_path", { path: eeInput.trim() });
+      setEeMsg("Saved — restart the app to apply the new path.");
+      setEePath(eeInput.trim());
+    } catch (e) {
+      setEeMsg(`Error: ${e}`);
+    }
+  };
+
+  return (
+    <div className="settings-section">
+      <div className="settings-section-title">Support</div>
+      <div className="settings-row" style={{ flexDirection: "column", alignItems: "stretch", gap: 8 }}>
+        <div className="settings-row-info" style={{ width: "100%" }}>
+          <span className="settings-row-label">EE.log Path</span>
+          <span className="settings-row-desc">
+            The log file FrameForge tails to detect relic reward screens.
+            If auto-discovery fails, paste your EE.log path below and click Save.
+          </span>
+        </div>
+        <input
+          type="text"
+          value={eeInput}
+          onChange={e => setEeInput(e.target.value)}
+          placeholder="/mnt/games/Steam/steamapps/compatdata/230410/pfx/drive_c/users/you/AppData/Local/Warframe/EE.log"
+          style={{
+            width: "100%",
+            padding: "6px 10px",
+            background: "var(--surface)",
+            border: "1px solid var(--border)",
+            borderRadius: 4,
+            color: "var(--text)",
+            fontSize: 12,
+            fontFamily: "monospace",
+          }}
+        />
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <button className="btn-secondary" onClick={saveCustomPath}>Save Path</button>
+          <button className="btn-secondary" onClick={refreshEePath}>Refresh</button>
+          {eeMsg && <span style={{ fontSize: 11, color: eeMsg.startsWith("Saved") ? "#3fb950" : "#f85149" }}>{eeMsg}</span>}
+        </div>
+        {eePath && !eePath.startsWith("Not") && !eePath.startsWith("Error") && (
+          <code style={{ fontSize: 11, color: "var(--muted)" }}>Current: {eePath}</code>
+        )}
+      </div>
+      <div className="settings-row">
+        <div className="settings-row-info">
+          <span className="settings-row-label">Debug Log</span>
+          <span className="settings-row-desc">
+            Main app debug output. Useful when the overlay never appears.
+            Written to <code>{debugPath}</code>.
+          </span>
+        </div>
+      </div>
+      <div className="settings-row">
+        <div className="settings-row-info">
+          <span className="settings-row-label">Session Log</span>
+          <span className="settings-row-desc">
+            Step-by-step log of the last overlay attempt. Share this when reporting overlay issues.
+            {logPath && (
+              <>
+                {" "}Written to <code>{logPath}</code>.
+              </>
+            )}
+          </span>
+        </div>
+        <button className="btn-secondary" onClick={async () => {
+          try {
+            const text = await invoke<string>("get_overlay_session_log");
+            alert(text);
+          } catch (e) { alert(`Error: ${e}`); }
+        }}>View Log</button>
+      </div>
+    </div>
+  );
 }
 
 // ─── Standalone modular window page (runs in pop-out Tauri window) ────────────
@@ -323,8 +451,16 @@ function ModularWindowPage() {
 
 export default function App() {
   // If we're the overlay window, render only the overlay UI
-  if (IS_OVERLAY) return <Overlay />;
-  if (IS_RIVEN_OVERLAY) return <RivenOverlayWindow />;
+  if (IS_OVERLAY) return (
+    <ErrorBoundary>
+      <Overlay />
+    </ErrorBoundary>
+  );
+  if (IS_RIVEN_OVERLAY) return (
+    <ErrorBoundary>
+      <RivenOverlayWindow />
+    </ErrorBoundary>
+  );
   // If we're the pop-out modular window, render the standalone modular UI
   if (IS_MODULAR) return <ModularWindowPage />;
 
@@ -384,6 +520,18 @@ export default function App() {
   const [colorblindMode, setColorblindMode] = useState(() =>
     localStorage.getItem("ff-colorblind") === "true"
   );
+  // Warframe in-game UI scale (fraction; 1.0 = 100%). Lets the reward OCR and
+  // overlay geometry match users who run a smaller in-game UI.
+  // We accept either fraction (0.5) or percent (50) when loading.
+  const [uiScale, setUiScale] = useState(() => {
+    const raw = localStorage.getItem("ff-ui-scale") ?? "1";
+    const v = parseFloat(raw);
+    return v > 1 ? Math.min(100, Math.max(50, v)) / 100 : Math.min(1, Math.max(0.5, v));
+  });
+  // String mirror so the user can type freely (e.g. "7" then "5" for 75)
+  // without being clamped mid-keystroke. We only clamp on blur / Enter.
+  const [uiScaleInput, setUiScaleInput] = useState(Math.round(uiScale * 100).toString());
+  useEffect(() => { setUiScaleInput(Math.round(uiScale * 100).toString()); }, [uiScale]);
   const [manualId, setManualId] = useState("");
   const [manualNonce, setManualNonce] = useState("");
   const [manualMsg, setManualMsg] = useState("");
@@ -404,28 +552,35 @@ export default function App() {
   // Refs so we can read the latest state in the save callback without stale closures
   const settingsLoadedRef = useRef(false);
   const settingsRef = useRef({
-    overlayEnabled: true, overlayPriority: "completion", textScale: 1, colorblindMode: false, companionApiEnabled: false, memoryScannerEnabled: false,
+    overlayEnabled: true, overlayPriority: "completion", textScale: 1, colorblindMode: false, companionApiEnabled: false, memoryScannerEnabled: false, uiScale: 1,
     tracked: [] as string[], favorites: [] as string[], timerFavorites: [] as string[], fissureWatches: [] as FissureWatch[], modularWidth: 240,
     modularSectionOrder: ["tracking", "favorites", "timers"] as string[], modularPopout: false,
   });
-  settingsRef.current = { overlayEnabled, overlayPriority, textScale, colorblindMode, companionApiEnabled, memoryScannerEnabled, tracked, favorites, timerFavorites, fissureWatches, modularWidth, modularSectionOrder, modularPopout };
+  settingsRef.current = { overlayEnabled, overlayPriority, textScale, colorblindMode, companionApiEnabled, memoryScannerEnabled, uiScale, tracked, favorites, timerFavorites, fissureWatches, modularWidth, modularSectionOrder, modularPopout };
 
   const saveAllSettings = useCallback(() => {
     invoke("save_settings", { json: JSON.stringify(settingsRef.current) }).catch(() => {});
   }, []); // eslint-disable-line
 
   // ── Memory scanner toggle ─────────────────────────────────────────────────
+  // Propagate the settings toggle to the Rust side so the monitor thread
+  // gates its actual memory reads without killing the overlay OCR thread.
   useEffect(() => {
-    if (memoryScannerEnabled) {
-      invoke("start_monitor").then(() => setMonitoring(true)).catch(() => {});
-    } else {
-      invoke("stop_monitor").then(() => setMonitoring(false)).catch(() => {});
+    if (settingsLoadedRef.current) {
+      invoke("set_memory_scan_enabled", { enabled: memoryScannerEnabled }).catch(() => {});
     }
   }, [memoryScannerEnabled]); // eslint-disable-line
 
+  // ── UI scale → backend ─────────────────────────────────────────────────────
+  // Keep the Rust OCR loop's card geometry in sync with the in-game UI scale.
+  useEffect(() => {
+    invoke("set_ui_scale", { scale: uiScale }).catch(() => {});
+  }, [uiScale]); // eslint-disable-line
+
   // ── Log watcher — always start regardless of memory scanner toggle ─────────
-  // EE.log is plain file I/O (not memory reading) — handles riven detection,
-  // trade completion, and WFM whisper detection unconditionally.
+  // EE.log is plain file I/O (not memory reading). On Linux this handles riven
+  // screen open/close detection; trade completion and WFM whisper detection are
+  // handled by start_monitor's EE.log tail (not duplicated here).
   useEffect(() => {
     invoke("start_log_watcher").catch(() => {});
   }, []); // eslint-disable-line
@@ -463,7 +618,10 @@ export default function App() {
       try {
         const s = JSON.parse(json);
         if (typeof s.companionApiEnabled === "boolean") setCompanionApiEnabled(s.companionApiEnabled);
-        if (typeof s.memoryScannerEnabled === "boolean") setMemoryScannerEnabled(s.memoryScannerEnabled);
+        if (typeof s.memoryScannerEnabled === "boolean") {
+          setMemoryScannerEnabled(s.memoryScannerEnabled);
+          invoke("set_memory_scan_enabled", { enabled: s.memoryScannerEnabled }).catch(() => {});
+        }
         if (typeof s.overlayEnabled === "boolean") {
           setOverlayEnabled(s.overlayEnabled);
           localStorage.setItem("ff-overlay-enabled", String(s.overlayEnabled));
@@ -480,6 +638,12 @@ export default function App() {
         if (typeof s.colorblindMode === "boolean") {
           setColorblindMode(s.colorblindMode);
           localStorage.setItem("ff-colorblind", String(s.colorblindMode));
+        }
+        if (typeof s.uiScale === "number") {
+          const v = s.uiScale > 1 ? Math.min(100, Math.max(50, s.uiScale)) / 100 : Math.min(1, Math.max(0.5, s.uiScale));
+          setUiScale(v);
+          localStorage.setItem("ff-ui-scale", v.toString());
+          invoke("set_ui_scale", { scale: v }).catch(() => {});
         }
         if (Array.isArray(s.tracked)) setTracked(s.tracked);
         if (Array.isArray(s.favorites)) setFavorites(s.favorites);
@@ -533,11 +697,11 @@ export default function App() {
         .catch(() => {});
     }).catch(() => {});
 
-    // Auto-start monitor on launch — only if memory scanner is explicitly enabled
+    // Auto-start monitor on launch — always start background threads
+    // (overlay OCR needs them). Memory scanning itself is gated separately.
     invoke<boolean>("get_monitor_status").then(active => {
       if (!active) {
-        // memoryScannerEnabled not yet loaded from settings at this point;
-        // the effect below handles delayed auto-start after settings load.
+        invoke("start_monitor").then(() => setMonitoring(true)).catch(() => {});
       } else {
         setMonitoring(true);
       }
@@ -622,14 +786,10 @@ export default function App() {
   // ── Monitor toggle ─────────────────────────────────────────────────────────
 
   const toggleMonitor = useCallback(async () => {
-    if (monitoring) {
-      await invoke("stop_monitor");
-      setMonitoring(false);
-    } else {
-      await invoke("start_monitor");
-      setMonitoring(true);
-    }
-  }, [monitoring]);
+    // Toggle memory scanning on/off. The background monitor threads
+    // (including overlay OCR) keep running — only the memory read is gated.
+    setMemoryScannerEnabled(prev => !prev);
+  }, []);
 
   const toggleTracked = useCallback((id: string) => {
     setTracked(prev => prev.includes(id) ? prev.filter(i => i !== id) : [...prev, id]);
@@ -857,9 +1017,20 @@ export default function App() {
       localStorage.setItem("ff-api-mod-copies", JSON.stringify(apiModCopies));
   }, [apiModCopies]);
 
-  useEffect(() => {
-    if (settingsLoadedRef.current) saveAllSettings();
-  }, [tracked, favorites, modularWidth, memoryScannerEnabled, companionApiEnabled, modularSectionOrder, modularPopout]); // eslint-disable-line
+  useEffect(() => { if (settingsLoadedRef.current) saveAllSettings(); }, [tracked]);              // eslint-disable-line
+  useEffect(() => { if (settingsLoadedRef.current) saveAllSettings(); }, [favorites]);             // eslint-disable-line
+  useEffect(() => { if (settingsLoadedRef.current) saveAllSettings(); }, [modularWidth]);          // eslint-disable-line
+  useEffect(() => { if (settingsLoadedRef.current) saveAllSettings(); }, [memoryScannerEnabled]);  // eslint-disable-line
+  useEffect(() => { if (settingsLoadedRef.current) saveAllSettings(); }, [companionApiEnabled]);   // eslint-disable-line
+  useEffect(() => { if (settingsLoadedRef.current) saveAllSettings(); }, [modularSectionOrder]); // eslint-disable-line
+  useEffect(() => { if (settingsLoadedRef.current) saveAllSettings(); }, [modularPopout]); // eslint-disable-line
+  useEffect(() => { if (settingsLoadedRef.current) saveAllSettings(); }, [memoryScannerEnabled]); // eslint-disable-line
+  useEffect(() => { if (settingsLoadedRef.current) saveAllSettings(); }, [companionApiEnabled]); // eslint-disable-line
+  useEffect(() => { if (settingsLoadedRef.current) saveAllSettings(); }, [overlayEnabled]); // eslint-disable-line
+  useEffect(() => { if (settingsLoadedRef.current) saveAllSettings(); }, [overlayPriority]); // eslint-disable-line
+  useEffect(() => { if (settingsLoadedRef.current) saveAllSettings(); }, [textScale]); // eslint-disable-line
+  useEffect(() => { if (settingsLoadedRef.current) saveAllSettings(); }, [colorblindMode]); // eslint-disable-line
+  useEffect(() => { if (settingsLoadedRef.current) { saveAllSettings(); localStorage.setItem("ff-ui-scale", uiScale.toString()); } }, [uiScale]); // eslint-disable-line
 
   // ── Modular pop-out window ─────────────────────────────────────────────────
   useEffect(() => {
@@ -949,7 +1120,6 @@ export default function App() {
   useEffect(() => {
     // Core OCR + overlay display. Called manually via button or (future) auto-detection.
     const runRivenCheck = async () => {
-      _rivenLastTriggerMs = Date.now();
       _rivenRollCount++;
       const { emit } = await import("@tauri-apps/api/event");
 
@@ -969,23 +1139,105 @@ export default function App() {
         const unsubReady = await listen("riven-window-ready", async () => {
           unsubReady();
           windowReady = true;
+          // Linux: float the in-process riven overlay above a fullscreen game via
+          // EWMH/compositor hints (no-op on Windows). The command applies the hints
+          // on a short delay internally, once the XWayland window is mapped.
+          invoke("make_riven_overlay_floating").catch(() => {});
           if (pendingPayload) { await emit("riven-analysis-update", pendingPayload).catch(() => {}); pendingPayload = null; }
         });
       }
 
-      try {
-        const ocrResult = await invoke<{ weapon: string; positives: string[]; negatives: string[]; rolled_stats: {name:string;value:string;positive:boolean}[]; is_comparison: boolean; original_rolled_stats: {name:string;value:string;positive:boolean}[]; raw: string }>("ocr_riven_screen");
-        const analysis = (ocrResult.weapon || ocrResult.positives.length > 0)
-          ? await invoke("analyze_riven", { weapon: ocrResult.weapon, positives: ocrResult.positives, negatives: ocrResult.negatives }).catch(() => null)
-          : null;
-        const payload = { analysis, ocrRaw: ocrResult.raw, weapon: ocrResult.weapon, positives: ocrResult.positives, negatives: ocrResult.negatives, rolledStats: ocrResult.rolled_stats, isComparison: ocrResult.is_comparison, originalStats: ocrResult.original_rolled_stats, rollCount: _rivenRollCount };
+      // ── Repeat-scan + majority vote ──────────────────────────────────────
+      // OCR is noisy, so we scan repeatedly while the overlay is visible:
+      //   Phase A: require 2 reads agreeing on the same parsed roll before the
+      //     first result shows (fallback to the best read after CONFIRM_MAX_SCANS
+      //     so a stubbornly-noisy roll still displays something).
+      //   Phase B: keep scanning up to MAX_REPEATS more times, always showing
+      //     whichever roll has the most votes so far ("most probable").
+      // A new Check/New-Roll bumps _rivenScanCycle, cancelling this loop.
+      const cycle = ++_rivenScanCycle;
+      const VOTES_TO_SHOW = 2;
+      const CONFIRM_MAX_SCANS = 6;
+      const MAX_REPEATS = 10;
+      const votes = new Map<string, { count: number; payload: any }>();
+      let shownKey: string | null = null;
+      let scans = 0;
+      let repeatsAfterShow = 0;
+      let lastPayload: any = null;
+
+      const emitPayload = async (payload: any) => {
+        if (cycle !== _rivenScanCycle) return; // superseded by a newer roll
         if (windowReady) { await emit("riven-analysis-update", payload).catch(() => {}); }
-        else              { pendingPayload = payload; }
-      } catch (e) {
-        await invoke("ocr_riven_log_error", { error: String(e) }).catch(() => {});
-        const payload = { analysis: null, ocrRaw: `OCR ERROR: ${e}`, weapon: "", positives: [], negatives: [], rolledStats: [], isComparison: false, originalStats: [], rollCount: _rivenRollCount };
-        if (windowReady) { await emit("riven-analysis-update", payload).catch(() => {}); }
-        else              { pendingPayload = payload; }
+        else             { pendingPayload = payload; }
+      };
+
+      while (cycle === _rivenScanCycle && _rivenWin) {
+        scans++;
+        try {
+          const o = await invoke<{ weapon: string; positives: string[]; negatives: string[]; rolled_stats: {name:string;value:string;positive:boolean}[]; is_comparison: boolean; original_rolled_stats: {name:string;value:string;positive:boolean}[]; raw: string }>("ocr_riven_screen");
+          if (cycle !== _rivenScanCycle) break;
+          const analysis = (o.weapon || o.positives.length > 0)
+            ? await invoke("analyze_riven", { weapon: o.weapon, positives: o.positives, negatives: o.negatives }).catch(() => null)
+            : null;
+          const payload = { analysis, ocrRaw: o.raw, weapon: o.weapon, positives: o.positives, negatives: o.negatives, rolledStats: o.rolled_stats, isComparison: o.is_comparison, originalStats: o.original_rolled_stats, rollCount: _rivenRollCount };
+          lastPayload = payload;
+
+          // Only reads that actually parsed a roll get a vote.
+          if (o.weapon || o.positives.length > 0) {
+            const key = `${o.weapon}|${[...o.positives].sort().join(",")}|${[...o.negatives].sort().join(",")}`;
+            const v = votes.get(key) ?? { count: 0, payload };
+            v.count++; v.payload = payload; votes.set(key, v);
+          }
+        } catch (e) {
+          await invoke("ocr_riven_log_error", { error: String(e) }).catch(() => {});
+          if (cycle !== _rivenScanCycle) break;
+          // Surface the error only if nothing has shown after the confirm window,
+          // so the overlay isn't left blank on a persistent failure.
+          if (shownKey === null && scans >= CONFIRM_MAX_SCANS) {
+            await emitPayload({ analysis: null, ocrRaw: `OCR ERROR: ${e}`, weapon: "", positives: [], negatives: [], rolledStats: [], isComparison: false, originalStats: [], rollCount: _rivenRollCount });
+            shownKey = "";
+          }
+          // Honor the repeat budget and screen-close even when capture keeps
+          // failing, so a persistent OCR error can't spin this loop forever.
+          if (shownKey !== null) {
+            repeatsAfterShow++;
+            if (repeatsAfterShow >= MAX_REPEATS) break;
+          }
+          const status = await invoke<string>("riven_screen_status").catch(() => "unknown");
+          if (cycle !== _rivenScanCycle || status === "closed") break;
+          await new Promise(r => setTimeout(r, 400));
+          continue;
+        }
+
+        // Current majority (most-voted) roll.
+        let majKey: string | null = null, majCount = 0, majPayload: any = null;
+        for (const [k, v] of votes) if (v.count > majCount) { majCount = v.count; majKey = k; majPayload = v.payload; }
+
+        if (shownKey === null) {
+          // Phase A — show once 2 reads agree; after CONFIRM_MAX_SCANS fall back
+          // to the best available read so the overlay isn't left blank.
+          if (majKey && majCount >= VOTES_TO_SHOW) {
+            shownKey = majKey;
+            await emitPayload(majPayload);
+          } else if (scans >= CONFIRM_MAX_SCANS && (majPayload ?? lastPayload)) {
+            shownKey = majKey ?? "";
+            await emitPayload(majPayload ?? lastPayload);
+          }
+        } else {
+          // Phase B — refine: show whichever roll now leads.
+          repeatsAfterShow++;
+          if (majKey && majKey !== shownKey && majPayload) {
+            shownKey = majKey;
+            await emitPayload(majPayload);
+          }
+          if (repeatsAfterShow >= MAX_REPEATS) break;
+        }
+
+        // Stop early if the player left the riven screen.
+        const status = await invoke<string>("riven_screen_status").catch(() => "unknown");
+        if (cycle !== _rivenScanCycle || status === "closed") break;
+
+        await new Promise(r => setTimeout(r, 400));
       }
     };
 
@@ -995,15 +1247,12 @@ export default function App() {
     // overlay "Start Comparison" button emits this event
     const unsubManual = listen("riven-manual-check", () => runRivenCheck().catch(() => {}));
 
-    // Open trigger: EE.log watcher fires "riven-screen-open" via FindFirstChangeNotificationW
-    // (instant file-write notification — no polling delay).
-    // 4 s cooldown prevents double-fires from the same log buffer flush.
-    const triggerOpen = () => {
-      const now = Date.now();
-      if (now - _rivenLastTriggerMs < 4000) return;
+    // Auto-detection: EE.log "OmegaRerollSelection.lua: Diorama setup" fires this
+    // (debounced 4s in the backend). Runs the OCR check automatically — no button
+    // press needed. A new fire bumps _rivenScanCycle, restarting the scan cleanly.
+    const unsubAutoDetect = listen("riven-screen-open", () => {
       runRivenCheck().catch(() => {});
-    };
-    const unsubAutoDetect = listen("riven-screen-open", () => triggerOpen());
+    });
 
     // Close triggers: EE.log (DiegeticArtifactCards HudVis 0) + manual dismiss.
     const unsubClose   = listen("riven-screen-close",   () => rivenWinHide("screen-close"));
@@ -1022,17 +1271,45 @@ export default function App() {
   useEffect(() => {
     let overlayWin: WebviewWindow | null = null;
     // Set to true when a dismiss arrives while the window is still being created.
-    // Checked in tauri://created to close immediately instead of showing items.
-    let dismissed   = false;
-    // Pending items buffered if they arrive before tauri://created fires.
-    let pendingItems: { items: string[]; positions: number[] } | null = null;
+    let dismissed = false;
+    // enriched.json is a single shared file the overlay polls. Repeat-scan
+    // refinements and the (slow, rate-limited) warframe.market price fetches both
+    // write it, so a late price fetch from an EARLIER reward set could otherwise
+    // overwrite a newer refinement. Each enrich bumps this generation; an async
+    // price write only lands if its generation is still current.
+    let relicEnrichGen = 0;
 
-    const closeOverlay = () => {
+    const closeOverlay = async () => {
       dismissed = true;
-      pendingItems = null;
       if (overlayWin) {
         overlayWin.close().catch(() => {});
         overlayWin = null;
+      }
+      // Also signal any subprocess overlay to close
+      await invoke("dismiss_overlay").catch(() => {});
+    };
+
+    // Resolve network-free reward metadata (names, ducats, owned counts, component
+    // lists) in the MAIN process — the overlay subprocess has no AppState. Used by
+    // both the initial spawn and the repeat-scan refinement updates.
+    const enrichRewardItems = async (items: string[], positions: number[], names?: string[]): Promise<any[]> => {
+      try {
+        const [catItems, quantities, craftingJobs] = await Promise.all([
+          invoke<any[]>("get_all_items"),
+          invoke<Record<string, number>>("get_current_quantities"),
+          invoke<CraftingJobTs[]>("get_current_crafting"),
+        ]);
+        const byUnique: Record<string, any> = {};
+        for (const it of catItems) byUnique[it.unique_name] = it;
+        const byCraft: Record<string, number> = {};
+        for (const job of craftingJobs) {
+          const lk = job.unique_name.replace("/Lotus/StoreItems/", "/Lotus/");
+          byCraft[lk] = (byCraft[lk] ?? 0) + 1;
+        }
+        return await buildLocalRewards(items, positions, byUnique, quantities, byCraft, names);
+      } catch (err) {
+        console.error("[FF overlay] reward enrichment failed:", err);
+        return [];
       }
     };
 
@@ -1041,53 +1318,17 @@ export default function App() {
       setTimeout(() => setOverlayStatus(""), 4000);
     });
 
-    // "relic-trigger" fires the moment EE.log detects the reward screen —
-    // we pre-create the overlay window immediately so it's ready by the time
-    // OCR finishes (window creation takes 1-2 s; OCR also takes ~700 ms).
+    // "relic-trigger" fires the moment EE.log detects the reward screen.
+    // We no longer pre-create the overlay here — instead we wait for OCR
+    // results and spawn the overlay via the Rust backend, which picks the
+    // best method for the current compositor (KDE native, XWayland, etc.).
     const unsubTrigger = listen<null>("relic-trigger", async () => {
       dismissed = false;
-      pendingItems = null;
-      const enabled = localStorage.getItem("ff-overlay-enabled") !== "false";
-      if (overlayWin || !enabled) return;
-      try {
-        const rect = await invoke<[number, number, number, number]>("get_warframe_window_rect");
-        const [wx, wy, ww, wh] = rect;
-        const stripY = wy + Math.round(wh * 0.60);
-        const stripH = Math.round(wh * 0.30);
-        const pri    = localStorage.getItem("ff-overlay-priority") ?? "completion";
-        overlayWin = new WebviewWindow("relic-overlay", {
-          url: `index.html?overlay&ww=${ww}&wh=${wh}&priority=${pri}`,
-          title: "FrameForge Overlay",
-          transparent: true, decorations: false,
-          alwaysOnTop: true, skipTaskbar: true,
-          resizable: false, focus: false,
-          x: wx, y: stripY, width: ww, height: stripH,
-        });
-
-        const _triggerWin = overlayWin;
-        overlayWin.once("tauri://destroyed", () => { overlayWin = null; pendingItems = null; });
-        overlayWin.once("tauri://created", async () => {
-          await _triggerWin.setIgnoreCursorEvents(true).catch(() => {});
-          if (dismissed) {
-            // Dismiss arrived while window was being created — close immediately
-            _triggerWin.close().catch(() => {});
-            dismissed = false;
-            overlayWin = null;
-            return;
-          }
-          if (pendingItems) {
-            // Items arrived before the window was ready — send them now
-            const { emit } = await import("@tauri-apps/api/event");
-            await emit("relic-rewards", pendingItems);
-            pendingItems = null;
-          }
-        });
-      } catch { /* Warframe not running */ }
     });
 
     const unsubRelic = listen<boolean>("relic-screen", () => { closeOverlay(); });
 
-    const unsub = listen<{ items: string[]; positions: number[] } | null>("relic-rewards", async (e) => {
+    const unsub = listen<{ items: string[]; positions: number[]; names?: string[] } | null>("relic-rewards", async (e) => {
       const rewards = e.payload;
 
       if (rewards && rewards.items.length >= 1) {
@@ -1095,44 +1336,87 @@ export default function App() {
         const enabled = localStorage.getItem("ff-overlay-enabled") !== "false";
         if (!enabled) return;
 
-        if (overlayWin) {
-          // Window already exists (pre-created by relic-trigger or previous emit)
-          const { emit } = await import("@tauri-apps/api/event");
-          await emit("relic-rewards", rewards);
-        } else {
-          // relic-trigger didn't fire or window wasn't ready — create now as fallback
-          pendingItems = rewards;
-          try {
-            const rect = await invoke<[number, number, number, number]>("get_warframe_window_rect");
-            const [wx, wy, ww, wh] = rect;
-            const stripY = wy + Math.round(wh * 0.54);
-            const stripH = Math.round(wh * 0.28);
-            const pri    = localStorage.getItem("ff-overlay-priority") ?? "completion";
-            overlayWin = new WebviewWindow("relic-overlay", {
-              url: `index.html?overlay&ww=${ww}&wh=${wh}&priority=${pri}`,
-              title: "FrameForge Overlay",
-              transparent: true, decorations: false,
-              alwaysOnTop: true, skipTaskbar: true,
-              resizable: false, focus: false,
-              x: wx, y: stripY, width: ww, height: stripH,
-            });
-    
-            const _fallbackWin = overlayWin;
-            overlayWin.once("tauri://destroyed", () => { overlayWin = null; pendingItems = null; });
-            overlayWin.once("tauri://created", async () => {
-              await _fallbackWin.setIgnoreCursorEvents(true).catch(() => {});
-              if (dismissed) { _fallbackWin.close().catch(() => {}); overlayWin = null; dismissed = false; return; }
-              if (pendingItems) {
-                const { emit } = await import("@tauri-apps/api/event");
-                await emit("relic-rewards", pendingItems);
-                pendingItems = null;
-              }
-            });
-          } catch { /* Warframe not running */ }
+        let rect: [number, number, number, number];
+        try {
+          rect = await invoke<[number, number, number, number]>("get_warframe_window_rect");
+        } catch (err) {
+          console.error("[FF overlay] get_warframe_window_rect failed:", err);
+          return;
+        }
+        const [_wx, _wy, ww, wh] = rect;
+        const pri = localStorage.getItem("ff-overlay-priority") ?? "completion";
+
+        // Resolve reward metadata HERE, in the main process. The overlay runs as
+        // a separate subprocess with no AppState, so its own invoke() calls return
+        // empty — it cannot resolve names/plat/ducats/components/ownership itself.
+        // We build the network-free data (names, ducats, owned counts, component
+        // lists) now so the overlay shows full info the instant it opens; prices
+        // (rate-limited warframe.market lookups) are pushed in right after.
+        const gen = ++relicEnrichGen;
+        const enriched = await enrichRewardItems(rewards.items, rewards.positions, rewards.names);
+
+        const payload = {
+          items: rewards.items,
+          positions: rewards.positions,
+          win_w: ww,
+          win_h: wh,
+          priority: pri,
+          dismiss_path: "/tmp/frameforge_overlay_dismiss",
+          kwin_script: false,
+          // Read through settingsRef (refreshed every render) rather than the
+          // memoryScannerEnabled closure variable: this listener is registered
+          // once in a useEffect([]) and would otherwise capture the mount-time
+          // value (false), so the overlay saw the scanner as off after the user
+          // toggled it on.
+          scanner_enabled: settingsRef.current.memoryScannerEnabled,
+          ui_scale: settingsRef.current.uiScale,
+          rewards: enriched,
+        };
+
+        try {
+          const method = await invoke<string>("spawn_overlay", { payload });
+          console.log("[FF overlay] spawn_overlay returned:", method);
+        } catch (err) {
+          console.error("[FF overlay] spawn_overlay failed:", err);
+        }
+
+        // Plat is already in `enriched` from the bulk snapshot, so the overlay
+        // shows it on first paint. Push the same priced data to satisfy the
+        // subprocess enriched-poll immediately (no extra round-trip). Only fall
+        // back to the live, rate-limited warframe.market path to fill any
+        // snapshot MISSES (item or component plat still null).
+        if (enriched.length) {
+          if (gen === relicEnrichGen) invoke("update_overlay_rewards", { rewards: enriched }).catch(() => {});
+          const hasMiss = enriched.some(r =>
+            r.plat == null || (r.components?.some((c: any) => c.plat == null) ?? false));
+          if (hasMiss) {
+            fetchRewardPrices(enriched)
+              .then(priced => { if (gen === relicEnrichGen) invoke("update_overlay_rewards", { rewards: priced }).catch(() => {}); })
+              .catch(() => {});
+          }
         }
       } else {
-        // Null = dismiss. Close overlay or set flag if window still being created.
+        // Null = dismiss
         closeOverlay();
+      }
+    });
+
+    // Live refinement from the repeat-scan majority vote. The overlay is already
+    // open, so we ONLY push updated reward data via update_overlay_rewards — never
+    // spawn again (that would create a second overlay subprocess).
+    const unsubRelicUpdate = listen<{ items: string[]; positions: number[]; names?: string[] }>("relic-rewards-update", async (e) => {
+      const r = e.payload;
+      if (dismissed || !r || r.items.length < 1) return;
+      const gen = ++relicEnrichGen;
+      const enriched = await enrichRewardItems(r.items, r.positions, r.names);
+      if (!enriched.length) return;
+      if (gen === relicEnrichGen) invoke("update_overlay_rewards", { rewards: enriched }).catch(() => {});
+      const hasMiss = enriched.some(x =>
+        x.plat == null || (x.components?.some((c: any) => c.plat == null) ?? false));
+      if (hasMiss) {
+        fetchRewardPrices(enriched)
+          .then(priced => { if (gen === relicEnrichGen) invoke("update_overlay_rewards", { rewards: priced }).catch(() => {}); })
+          .catch(() => {});
       }
     });
 
@@ -1141,6 +1425,7 @@ export default function App() {
       unsubRelic.then(fn => fn());
       unsubTrigger.then(fn => fn());
       unsubStatus.then(fn => fn());
+      unsubRelicUpdate.then(fn => fn());
       if (overlayWin) { overlayWin.close(); overlayWin = null; }
     };
   }, []);
@@ -1309,12 +1594,11 @@ export default function App() {
             >⚡ Connecting… (click to retry)</span>
           )}
           <button
-            className={`btn-monitor ${monitoring ? "active" : ""}`}
-            onClick={memoryScannerEnabled ? toggleMonitor : undefined}
-            disabled={!memoryScannerEnabled}
-            title={!memoryScannerEnabled ? "Enable Memory Scanner in Settings first" : undefined}
+            className={`btn-monitor ${memoryScannerEnabled ? "active" : ""}`}
+            onClick={toggleMonitor}
+            title={memoryScannerEnabled ? "Disable memory scanner" : "Enable memory scanner"}
           >
-            {monitoring ? "⏹ Stop" : "▶ Start monitor"}
+            {memoryScannerEnabled ? "⏹ Stop" : "▶ Start monitor"}
           </button>
           <button
             className="btn-icon-brand btn-discord"
@@ -1445,6 +1729,49 @@ export default function App() {
                       settingsRef.current = { ...settingsRef.current, textScale: v };
                       saveAllSettings();
                     }} />
+                </div>
+                <div className="settings-row" style={{ marginTop: 8 }}>
+                  <div className="settings-row-info">
+                    <span className="settings-row-label">Warframe UI Scale</span>
+                    <span className="settings-row-desc">
+                      Match your in-game UI Scale (Options → Interface) so the reward
+                      overlay lines up. Any integer from 50 to 100.
+                    </span>
+                  </div>
+                  <input
+                    type="number"
+                    min={50}
+                    max={100}
+                    step={1}
+                    value={uiScaleInput}
+                    style={{ width: 64, textAlign: "center" }}
+                    onChange={e => setUiScaleInput(e.target.value)}
+                    onBlur={e => {
+                      const raw = parseInt(e.target.value, 10);
+                      const pct = Number.isNaN(raw)
+                        ? Math.round(uiScale * 100)
+                        : Math.min(100, Math.max(50, raw));
+                      const v = pct / 100;
+                      setUiScale(v);
+                      localStorage.setItem("ff-ui-scale", v.toString());
+                      settingsRef.current = { ...settingsRef.current, uiScale: v };
+                      invoke("set_ui_scale", { scale: v }).catch(() => {});
+                      saveAllSettings();
+                    }}
+                    onKeyDown={e => {
+                      if (e.key !== "Enter") return;
+                      const raw = parseInt(e.currentTarget.value, 10);
+                      const pct = Number.isNaN(raw)
+                        ? Math.round(uiScale * 100)
+                        : Math.min(100, Math.max(50, raw));
+                      const v = pct / 100;
+                      setUiScale(v);
+                      localStorage.setItem("ff-ui-scale", v.toString());
+                      settingsRef.current = { ...settingsRef.current, uiScale: v };
+                      invoke("set_ui_scale", { scale: v }).catch(() => {});
+                      saveAllSettings();
+                    }}
+                  />
                 </div>
               </div>
 
@@ -1599,15 +1926,15 @@ export default function App() {
                 <div className="settings-row">
                   <div className="settings-row-info">
                     <span className="settings-row-label">Memory Scanner</span>
-                    <span className="settings-row-desc">{monitoring ? "Running — scans every 10 seconds" : "Stopped"}</span>
+                    <span className="settings-row-desc">{memoryScannerEnabled ? "Running — scans every 10 seconds" : "Stopped"}</span>
                   </div>
-                  <button className={`btn-secondary ${monitoring ? "btn-danger" : ""}`} onClick={toggleMonitor}>
-                    {monitoring ? "Stop" : "Start"}
+                  <button className={`btn-secondary ${memoryScannerEnabled ? "btn-danger" : ""}`} onClick={toggleMonitor}>
+                    {memoryScannerEnabled ? "Stop" : "Start"}
                   </button>
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 10 }}>
                   {[
-                    { label: "Memory Scanner",    ok: monitoring,      detail: monitoring ? `Running · last scan ${lastScan ? new Date(lastScan*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}) : "—"}` : "Stopped" },
+                    { label: "Memory Scanner",    ok: memoryScannerEnabled, detail: memoryScannerEnabled ? `Running · last scan ${lastScan ? new Date(lastScan*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}) : "—"}` : "Stopped" },
                     { label: "Warframe API",       ok: wfConnected,     detail: wfConnected ? `Connected · ${lastApiRefresh ? new Date(lastApiRefresh*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}) : "—"}` : warframeRunning ? "Game detected — scanning credentials…" : "Not connected" },
                     { label: "Warframe detected", ok: warframeRunning, detail: warframeRunning ? "Game is running" : "Game not detected" },
                   ].map(s => (
@@ -1642,24 +1969,7 @@ export default function App() {
               </div>
 
               {/* ── Support ── */}
-              <div className="settings-section">
-                <div className="settings-section-title">Support</div>
-                <div className="settings-row">
-                  <div className="settings-row-info">
-                    <span className="settings-row-label">Session Log</span>
-                    <span className="settings-row-desc">
-                      Step-by-step log of the last overlay attempt. Share this when reporting overlay issues.
-                      Written to <code>%TEMP%\frameforge_overlay_session.txt</code>.
-                    </span>
-                  </div>
-                  <button className="btn-secondary" onClick={async () => {
-                    try {
-                      const text = await invoke<string>("get_overlay_session_log");
-                      alert(text);
-                    } catch (e) { alert(`Error: ${e}`); }
-                  }}>View Log</button>
-                </div>
-              </div>
+              <SessionLogSupport />
 
               {/* ── About (always last) ── */}
               <div className="settings-section">
@@ -1780,7 +2090,7 @@ export default function App() {
             </aside>
 
             <div className="main">
-              {monitoring && warframeRunning && !inventorySynced && (
+              {memoryScannerEnabled && warframeRunning && !inventorySynced && (
                 <div className="sync-banner">
                   Inventory not synced yet — complete a mission or visit a relay to load your inventory
                 </div>
@@ -1827,9 +2137,9 @@ export default function App() {
               <div className="item-grid">
                 {visibleItems.length === 0 ? (
                   <div className="empty-msg" style={{gridColumn:"1/-1"}}>
-                    {monitoring
+                    {memoryScannerEnabled
                       ? "No items found. Complete a mission or visit a relay to sync inventory."
-                      : "Start the monitor to begin tracking your inventory."}
+                      : "Memory scanner is disabled — enable it in Settings to see your inventory."}
                   </div>
                 ) : (
                   visibleItems.flatMap(item => {

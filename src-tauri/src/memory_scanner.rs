@@ -423,16 +423,31 @@ pub fn scan_warframe_memory(unique_names: &[String], display_names: &[String]) -
         };
     }
 
-    let display_map: HashMap<String, String> = unique_names.iter()
-        .zip(display_names.iter())
-        .map(|(u, d)| (u.clone(), d.clone()))
+    // Build display_map with both raw catalog paths and /Lotus/-normalized paths.
+    // Warframe's in-memory inventory JSON uses /Lotus/... directly, but the
+    // WFCD catalog sometimes prefixes with /Lotus/StoreItems/...  Normalizing
+    // at lookup time ensures blueprint/component counts are not silently dropped.
+    let mut display_map: HashMap<String, String> = HashMap::new();
+    for (u, d) in unique_names.iter().zip(display_names.iter()) {
+        display_map.insert(u.clone(), d.clone());
+        let norm = u.replace("/Lotus/StoreItems/", "/Lotus/");
+        if norm != *u {
+            display_map.insert(norm, d.clone());
+        }
+    }
+
+    // Normalize catalog paths to match Warframe's in-memory JSON format
+    // (/Lotus/... instead of /Lotus/StoreItems/...) so the Aho-Corasick
+    // scanner and the resource-scanner skip-list both operate on the same
+    // paths the game actually writes.
+    let normalized_names_win: Vec<String> = unique_names.iter()
+        .map(|u| u.replace("/Lotus/StoreItems/", "/Lotus/"))
         .collect();
 
     // Unique-item paths: owned via ItemId/Configs, never have ItemCount in inventory
-    // Unique items: owned via ItemId+Configs, never have ItemCount in inventory.
     // NOTE: /Lotus/Types/Recipes/ is intentionally excluded — recipe blueprints
     // are stackable resources with ItemCount, handled by scanner 1, not here.
-    let unique_item_paths: Vec<String> = unique_names.iter()
+    let unique_item_paths: Vec<String> = normalized_names_win.iter()
         .filter(|p| {
             p.starts_with("/Lotus/Powersuits/")
                 || p.starts_with("/Lotus/Weapons/")
@@ -447,7 +462,7 @@ pub fn scan_warframe_memory(unique_names: &[String], display_names: &[String]) -
         .collect();
 
     let unique_item_idx: Vec<usize> = unique_item_paths.iter()
-        .map(|p| unique_names.iter().position(|u| u == p).unwrap())
+        .map(|p| normalized_names_win.iter().position(|u| u == p).unwrap())
         .collect();
 
     // Set of paths handled by the unique scanner — resource scanner skips exactly these
@@ -627,11 +642,18 @@ pub fn scan_warframe_memory(unique_names: &[String], display_names: &[String]) -
         let path = &unique_names[*catalog_idx];
         if resources.contains_key(path) { continue; }
         if let Some(name) = display_map.get(path) {
+            // Unique items (weapons/warframes) are validated by scan_inventory_unique:
+            // it requires "ItemId" and "Configs" in the surrounding JSON, so false
+            // positives from relic tables or market data are already filtered.
+            // Mark explicit so the monitor loop processes them through the
+            // stability buffer just like resources.  Quantity is always 1
+            // (you either own the item or you don't); the hit-count from
+            // the memory region is not stable across scans, so we don't use it.
             items_found.push(FoundItem {
                 unique_name: path.clone(),
                 name: name.clone(),
                 quantity: 1,
-                explicit_count: false,
+                explicit_count: true,
             });
         }
     }
@@ -657,7 +679,94 @@ pub fn scan_warframe_memory(unique_names: &[String], display_names: &[String]) -
 pub fn find_warframe_pid_pub() -> Option<u32> { find_warframe_pid() }
 
 #[cfg(not(target_os = "windows"))]
-pub fn find_warframe_pid_pub() -> Option<u32> { None }
+pub fn find_warframe_pid_pub() -> Option<u32> { find_warframe_pid_diag().0 }
+
+#[cfg(not(target_os = "windows"))]
+fn find_warframe_pid_diag() -> (Option<u32>, Vec<String>) {
+    use std::fs;
+
+    let mut best_pid: Option<u32> = None;
+    let mut best_score = 0i32;
+    let mut diagnostics: Vec<String> = Vec::new();
+    let mut candidates: Vec<(u32, i32, String)> = Vec::new();
+
+    let entries = match fs::read_dir("/proc") {
+        Ok(e) => e,
+        Err(e) => {
+            diagnostics.push(format!("Cannot read /proc: {}", e));
+            return (best_pid, diagnostics);
+        }
+    };
+
+    for entry in entries {
+        let entry = match entry { Ok(e) => e, Err(_) => continue };
+        let name = entry.file_name();
+        let pid_str = match name.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        let pid: u32 = match pid_str.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        let mut score = 0i32;
+        let mut signals: Vec<&str> = Vec::new();
+
+        if let Ok(comm) = fs::read_to_string(format!("/proc/{}/comm", pid)) {
+            let comm = comm.trim().to_lowercase();
+            if comm.contains("warframe") { score += 2; signals.push("comm"); }
+        }
+
+        if let Ok(cmdline) = fs::read_to_string(format!("/proc/{}/cmdline", pid)) {
+            let cmdline_lower = cmdline.to_lowercase();
+            if cmdline_lower.contains("warframe.x64.exe") { score += 10; signals.push("cmdline:x64"); }
+            else if cmdline_lower.contains("warframe.exe") { score += 8; signals.push("cmdline:exe"); }
+            else if cmdline_lower.contains("warframe") {
+                let is_probably_launcher = cmdline_lower.contains("launcher.exe")
+                    && !cmdline_lower.contains("warframe.x64.exe")
+                    && !cmdline_lower.contains("warframe.exe");
+                if !is_probably_launcher { score += 2; signals.push("cmdline"); }
+            }
+        }
+
+        if let Ok(exe_target) = fs::read_link(format!("/proc/{}/exe", pid)) {
+            let exe_lower = exe_target.to_string_lossy().to_lowercase();
+            if exe_lower.contains("wine") { score += 1; signals.push("exe:wine"); }
+        }
+
+        if let Ok(maps) = fs::read_to_string(format!("/proc/{}/maps", pid)) {
+            let maps_lower = maps.to_lowercase();
+            if maps_lower.contains("warframe.x64.exe") { score += 5; signals.push("maps:x64"); }
+            else if maps_lower.contains("warframe.exe") { score += 4; signals.push("maps:exe"); }
+            else if maps_lower.contains("warframe") { score += 1; signals.push("maps"); }
+        }
+
+        if score > 0 {
+            let comm_preview = fs::read_to_string(format!("/proc/{}/comm", pid))
+                .unwrap_or_default().trim().to_string();
+            candidates.push((pid, score, format!("{} (score={}, signals=[{}])", comm_preview, score, signals.join(","))));
+        }
+
+        if score > best_score {
+            best_score = score;
+            best_pid = Some(pid);
+        }
+    }
+
+    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    diagnostics.push(format!("Scanned /proc, found {} Warframe-related processes", candidates.len()));
+    for (i, (_, _, desc)) in candidates.iter().take(5).enumerate() {
+        diagnostics.push(format!("  candidate[{}]: {}", i, desc));
+    }
+    if let Some(pid) = best_pid {
+        diagnostics.push(format!("Selected PID {} with score {}", pid, best_score));
+    } else {
+        diagnostics.push("No Warframe process found".to_string());
+    }
+
+    (best_pid, diagnostics)
+}
 
 // ─── Riven validity flag scanner ──────────────────────────────────────────────
 //
@@ -787,10 +896,349 @@ fn find_warframe_pid() -> Option<u32> {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn scan_warframe_memory(_unique_names: &[String], _display_names: &[String]) -> ScanResult {
+pub fn scan_warframe_memory(unique_names: &[String], display_names: &[String]) -> ScanResult {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+
+    if unique_names.is_empty() {
+        return ScanResult {
+            warframe_running: false, items_found: vec![], pending_recipes: vec![], mastery_rank: None, mastery_data: HashMap::new(), regions_scanned: 0,
+            error: Some("No item paths loaded. Click 'Refresh item list' first.".to_string()),
+            log_lines: vec![], relic_rewards: None,
+        };
+    }
+
+    // Build display_map with both raw catalog paths and /Lotus/-normalized paths.
+    // Warframe's in-memory inventory JSON uses /Lotus/... directly, but the
+    // WFCD catalog sometimes prefixes with /Lotus/StoreItems/...  Normalizing
+    // at lookup time ensures blueprint/component counts are not silently dropped.
+    let mut display_map: HashMap<String, String> = HashMap::new();
+    for (u, d) in unique_names.iter().zip(display_names.iter()) {
+        display_map.insert(u.clone(), d.clone());
+        let norm = u.replace("/Lotus/StoreItems/", "/Lotus/");
+        if norm != *u {
+            display_map.insert(norm, d.clone());
+        }
+    }
+
+    // Normalize catalog paths to match Warframe's in-memory JSON format
+    // (/Lotus/... instead of /Lotus/StoreItems/...) so the Aho-Corasick
+    // scanner and the resource-scanner skip-list both operate on the same
+    // paths the game actually writes.
+    let normalized_names: Vec<String> = unique_names.iter()
+        .map(|u| u.replace("/Lotus/StoreItems/", "/Lotus/"))
+        .collect();
+
+    let unique_item_paths: Vec<String> = normalized_names.iter()
+        .filter(|p| {
+            p.starts_with("/Lotus/Powersuits/")
+                || p.starts_with("/Lotus/Weapons/")
+                || p.starts_with("/Lotus/Archwing/")
+                || p.starts_with("/Lotus/Types/Sentinels/SentinelPowersuits/")
+                || p.starts_with("/Lotus/Types/Sentinels/SentinelWeapons/")
+                || p.starts_with("/Lotus/Types/Friendly/")
+                || p.starts_with("/Lotus/Types/Game/CatbrowPet/")
+                || p.starts_with("/Lotus/Types/Game/KubrowPet/")
+        })
+        .cloned()
+        .collect();
+
+    let unique_item_idx: Vec<usize> = unique_item_paths.iter()
+        .map(|p| normalized_names.iter().position(|u| u == p).unwrap())
+        .collect();
+
+    let unique_path_set: std::collections::HashSet<String> =
+        unique_item_paths.iter().cloned().collect();
+
+    let unique_ac = {
+        use aho_corasick::AhoCorasick;
+        let patterns: Vec<Vec<u8>> = unique_item_paths.iter().map(|p| {
+            let mut pat = b"\"ItemType\":\"".to_vec();
+            pat.extend_from_slice(p.as_bytes());
+            pat.push(b'"');
+            pat
+        }).collect();
+        let refs: Vec<&[u8]> = patterns.iter().map(|p| p.as_slice()).collect();
+        match AhoCorasick::new(&refs) {
+            Ok(a) => a,
+            Err(e) => return ScanResult {
+                warframe_running: false, items_found: vec![], pending_recipes: vec![], mastery_rank: None, mastery_data: HashMap::new(), regions_scanned: 0,
+                error: Some(format!("AC build error: {}", e)),
+                log_lines: vec![], relic_rewards: None,
+            },
+        }
+    };
+
+    let (pid_opt, diag) = find_warframe_pid_diag();
+    let mut log_lines: Vec<String> = diag;
+
+    let pid = match pid_opt {
+        Some(p) => p,
+        None => return ScanResult {
+            warframe_running: false, items_found: vec![], pending_recipes: vec![], mastery_rank: None, mastery_data: HashMap::new(), regions_scanned: 0,
+            error: Some("Warframe is not running. Launch the game first.".to_string()),
+            log_lines, relic_rewards: None,
+        },
+    };
+
+    let mem_path = format!("/proc/{}/mem", pid);
+    let mut mem_file = match File::open(&mem_path) {
+        Ok(f) => f,
+        Err(e) => return ScanResult {
+            warframe_running: true, items_found: vec![], pending_recipes: vec![], mastery_rank: None, mastery_data: HashMap::new(), regions_scanned: 0,
+            error: Some(format!("Cannot open Warframe process memory: {}. Try running with appropriate permissions.", e)),
+            log_lines, relic_rewards: None,
+        },
+    };
+    log_lines.push(format!("Opened {}", mem_path));
+
+    let maps_path = format!("/proc/{}/maps", pid);
+    let maps_str = match std::fs::read_to_string(&maps_path) {
+        Ok(s) => s,
+        Err(e) => return ScanResult {
+            warframe_running: true, items_found: vec![], pending_recipes: vec![], mastery_rank: None, mastery_data: HashMap::new(), regions_scanned: 0,
+            error: Some(format!("Cannot read process maps: {}", e)),
+            log_lines, relic_rewards: None,
+        },
+    };
+    let map_lines: Vec<&str> = maps_str.lines().collect();
+    log_lines.push(format!("Parsed {} lines from {}", map_lines.len(), maps_path));
+
+    let mut resources:       HashMap<String, i64>          = HashMap::new();
+    let mut unique:          HashMap<usize, usize>         = HashMap::new();
+    let mut mastery_data:    HashMap<usize, u32>           = HashMap::new();
+    let mut pending_recipes: Vec<PendingRecipe>            = Vec::new();
+    let mut mastery_rank:    Option<u32>                   = None;
+    let mut regions_scanned = 0usize;
+
+    let start_time = std::time::Instant::now();
+    let mut total_read: usize = 0;
+
+    for line in maps_str.lines() {
+        if start_time.elapsed().as_secs() > 90 || total_read > 2_000_000_000 { break; }
+
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 { continue; }
+
+        let addr_range = parts[0];
+        let perms = parts[1];
+        if !perms.starts_with('r') { continue; }
+        if perms.contains('x') && !perms.contains('w') { continue; } // skip pure code sections
+
+        let mut addr_iter = addr_range.split('-');
+        let start_addr = match addr_iter.next() {
+            Some(s) => match usize::from_str_radix(s, 16) { Ok(v) => v, Err(_) => continue },
+            None => continue,
+        };
+        let end_addr = match addr_iter.next() {
+            Some(s) => match usize::from_str_radix(s, 16) { Ok(v) => v, Err(_) => continue },
+            None => continue,
+        };
+
+        let region_size = end_addr.saturating_sub(start_addr);
+        if region_size < 4096 || region_size > 128 * 1024 * 1024 { continue; }
+
+        // Skip kernel special regions
+        if parts.len() >= 6 {
+            let path = parts[5];
+            if path.starts_with("[vvar]") || path.starts_with("[vdso]") || path.starts_with("[vsyscall]") {
+                continue;
+            }
+        }
+
+        let mut buffer = vec![0u8; region_size];
+        let bytes_read = match mem_file.seek(SeekFrom::Start(start_addr as u64)) {
+            Ok(_) => match mem_file.read(&mut buffer) {
+                Ok(n) => n,
+                Err(_) => continue,
+            },
+            Err(_) => continue,
+        };
+
+        if bytes_read <= 4 { continue; }
+
+        let data = &buffer[..bytes_read];
+        regions_scanned += 1;
+        total_read += bytes_read;
+
+        // Scanner 1: Resources
+        if bytes_read <= 512 * 1024 {
+            let res_pairs = scan_inventory_resources(data, &unique_path_set);
+            if !res_pairs.is_empty() {
+                let preview: String = res_pairs.iter().take(5)
+                    .map(|(p, q)| format!("{}={}", p.split('/').last().unwrap_or("?"), q))
+                    .collect::<Vec<_>>().join(", ");
+                log_lines.push(format!(
+                    "  [resources] 0x{:010x} count={:>4}  {}{}",
+                    start_addr, res_pairs.len(), preview,
+                    if res_pairs.len() > 5 { format!(" …+{}", res_pairs.len()-5) } else { String::new() }
+                ));
+                for (path, qty) in res_pairs {
+                    let e = resources.entry(path).or_insert(qty);
+                    if qty > *e { *e = qty; }
+                }
+            }
+        }
+
+        // Mastery rank
+        if mastery_rank.is_none() && bytes_read <= 512 * 1024 {
+            mastery_rank = scan_mastery_rank(data);
+        }
+
+        // Scanner 3: Pending recipes
+        if data.windows(12).any(|w| w == b"$numberLong\"") {
+            let hits = scan_pending_recipes(data);
+            log_lines.push(format!(
+                "  [numlong]   0x{:010x} size={} crafting_hits={}",
+                start_addr, bytes_read, hits.len()
+            ));
+            for h in hits { pending_recipes.push(h); }
+        }
+
+        // Scanner 2: Unique items
+        let unique_hits = scan_inventory_unique(data, &unique_ac);
+        if !unique_hits.is_empty() {
+            let preview: String = unique_hits.iter().take(4)
+                .map(|(li, _)| unique_item_paths[*li].split('/').last().unwrap_or("?"))
+                .collect::<Vec<_>>().join(", ");
+            log_lines.push(format!(
+                "  [unique]    0x{:010x} count={:>4}  {}{}",
+                start_addr, unique_hits.len(), preview,
+                if unique_hits.len() > 4 { format!(" …+{}", unique_hits.len()-4) } else { String::new() }
+            ));
+            let n = unique_hits.len();
+            for &(local_idx, rank) in &unique_hits {
+                let catalog_idx = unique_item_idx[local_idx];
+                let entry = unique.entry(catalog_idx).or_insert(n);
+                if n > *entry { *entry = n; }
+                if let Some(r) = rank {
+                    let mr = mastery_data.entry(catalog_idx).or_insert(0);
+                    if r > *mr { *mr = r; }
+                }
+            }
+        }
+    }
+
+    // Assemble results
+    let mut items_found: Vec<FoundItem> = Vec::new();
+
+    // Debug: dump every recipe path found (before display_map filtering)
+    let recipe_paths: Vec<(&String, &i64)> = resources.iter()
+        .filter(|(p, _)| p.starts_with("/Lotus/Types/Recipes/"))
+        .collect();
+    if !recipe_paths.is_empty() {
+        log_lines.push(format!(
+            "  [recipes]   found={} recipes (blueprints/components)",
+            recipe_paths.len()
+        ));
+        // Write full list to a temp file so we can inspect path mismatches
+        let debug_txt = recipe_paths.iter()
+            .map(|(p, q)| format!("{} = {}", p, q))
+            .collect::<Vec<_>>().join("\n");
+        let _ = std::fs::write(
+            std::env::temp_dir().join("frameforge_scan_recipes.txt"),
+            debug_txt
+        );
+        // Also show dropped paths (in memory but not in catalog)
+        let dropped: Vec<&String> = recipe_paths.iter()
+            .filter(|(p, _)| !display_map.contains_key(p.as_str()))
+            .map(|(p, _)| *p)
+            .collect();
+        if !dropped.is_empty() {
+            let preview: Vec<String> = dropped.iter().take(10)
+                .map(|p| p.to_string())
+                .collect();
+            log_lines.push(format!(
+                "  [recipes]   DROPPED (not in catalog) count={}: {}",
+                dropped.len(),
+                preview.join(", ")
+            ));
+        }
+    }
+
+    for (path, qty) in &resources {
+        if let Some(name) = display_map.get(path) {
+            items_found.push(FoundItem {
+                unique_name: path.clone(),
+                name: name.clone(),
+                quantity: *qty,
+                explicit_count: true,
+            });
+        }
+    }
+
+    let mastery_data_out: HashMap<String, u32> = mastery_data.iter()
+        .map(|(idx, rank)| (unique_names[*idx].clone(), *rank))
+        .collect();
+
+    for (catalog_idx, _n) in &unique {
+        let path = &unique_names[*catalog_idx];
+        if resources.contains_key(path) { continue; }
+        if let Some(name) = display_map.get(path) {
+            // Unique items (weapons/warframes) are validated by scan_inventory_unique:
+            // it requires "ItemId" and "Configs" in surrounding JSON, so false
+            // positives from relic tables or market data are already filtered.
+            // Mark explicit so the monitor loop processes them through the
+            // stability buffer just like resources.  Quantity is always 1
+            // (you either own the item or you don't); the hit-count from
+            // the memory region is not stable across scans, so we don't use it.
+            items_found.push(FoundItem {
+                unique_name: path.clone(),
+                name: name.clone(),
+                quantity: 1,
+                explicit_count: true,
+            });
+        }
+    }
+
+    items_found.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Debug: show first 20 recipe/blueprint items with quantities
+    let recipe_items: Vec<&FoundItem> = items_found.iter()
+        .filter(|i| i.unique_name.starts_with("/Lotus/Types/Recipes/"))
+        .collect();
+    if !recipe_items.is_empty() {
+        let preview = recipe_items.iter().take(20)
+            .map(|i| format!("{}={}", i.name, i.quantity))
+            .collect::<Vec<_>>().join(", ");
+        log_lines.push(format!(
+            "  RECIPES: count={}  {}",
+            recipe_items.len(), preview
+        ));
+    }
+
+    log_lines.push(format!(
+        "  TOTALS: resources={} unique={} total={}",
+        resources.len(), unique.len(), items_found.len()
+    ));
+
+    pending_recipes.sort_by_key(|r| r.completion_ms);
+    pending_recipes.dedup_by(|a, b| {
+        if a.unique_name == b.unique_name { b.completion_ms = b.completion_ms.max(a.completion_ms); true }
+        else { false }
+    });
+
+    let error = if regions_scanned == 0 {
+        Some(format!(
+            "Found Warframe process (PID {}) but could not read any memory regions. \
+             This usually means Easy Anti-Cheat has restricted access. \
+             Try: (1) running FrameForge before launching Warframe, or \
+             (2) checking /proc/{}/maps and /proc/{}/mem manually.",
+            pid, pid, pid
+        ))
+    } else {
+        None
+    };
+
     ScanResult {
-        warframe_running: false, items_found: vec![], pending_recipes: vec![], mastery_rank: None, mastery_data: HashMap::new(), regions_scanned: 0,
-        error: Some("Memory scanning is only supported on Windows.".to_string()),
-        log_lines: vec![], relic_rewards: None,
+        warframe_running: true,
+        items_found,
+        pending_recipes,
+        mastery_rank,
+        mastery_data: mastery_data_out,
+        regions_scanned,
+        error,
+        log_lines,
+        relic_rewards: None,
     }
 }
