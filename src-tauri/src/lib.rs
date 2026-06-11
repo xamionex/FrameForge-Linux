@@ -1,14 +1,18 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager, State};
 
 mod db;
+mod log_parser;
 mod memory_scanner;
 mod ocr;
 mod wfcd;
+
+#[cfg(not(target_os = "windows"))]
+pub mod overlay_linux;
 
 use db::{QuantityChange, SnapshotPoint, Trade, TrackedItem};
 use wfcd::{RecipeComponent, SyndicateOffer, WfcdItem};
@@ -21,6 +25,7 @@ pub struct AppState {
     pub relic_rewards_cache_path: PathBuf,
     pub quantities_cache_path: PathBuf,
     pub inventory_state_cache_path: PathBuf,
+    pub prices_snapshot_cache_path: PathBuf,
     pub settings_path: PathBuf,
     pub log_path: PathBuf,
     pub changes_log_path: PathBuf,
@@ -53,8 +58,18 @@ pub struct AppState {
     /// When true, save a timestamped inventory blob to blobs/ on each full scan pass.
     pub blob_log_enabled: Arc<AtomicBool>,
     pub blob_log_dir: PathBuf,
+    /// In-game Warframe UI scale as a percentage (50–100; 100 = default/full).
+    /// Drives the OCR reward-card geometry so capture works at non-default scales.
+    /// Stored as an integer percent so it can live in a lock-free atomic.
+    pub ui_scale_pct: Arc<AtomicU32>,
+    /// User-override for EE.log path (persists across restarts via settings file).
+    pub ee_log_override: Mutex<Option<PathBuf>>,
     /// WFM slug → median sell price (None = item not listed on WFM). Shared across all windows.
     pub wfm_price_cache: Mutex<HashMap<String, Option<u32>>>,
+    /// Bulk price snapshot (wfinfo `custom_avg`), keyed by normalized slug.
+    /// Downloaded once from api.warframestat.us; makes reward/Market plat instant
+    /// (no per-item warframe.market call on the hot path). Shared with refresh thread.
+    pub wfm_bulk_prices: Arc<Mutex<HashMap<String, f32>>>,
     /// Active WFM session (JWT + username). Held in memory only, never written to disk.
     pub wfm_session: Arc<Mutex<Option<WfmSession>>>,
     /// Path to the persisted top-WFM-items cache (survives restarts).
@@ -419,10 +434,8 @@ async fn scan_warframe_credentials() -> Result<(String, String, String), String>
         .map_err(|e| e.to_string())?
 }
 
+#[cfg(target_os = "windows")]
 fn scan_warframe_credentials_sync() -> Result<(String, String, String), String> {
-    #[cfg(not(target_os = "windows"))]
-    { return Err("Only supported on Windows".into()); }
-    #[cfg(target_os = "windows")]
     use windows_sys::Win32::{
         Foundation::CloseHandle,
         System::{
@@ -474,12 +487,79 @@ fn scan_warframe_credentials_sync() -> Result<(String, String, String), String> 
         CloseHandle(process);
     }
     Err("Credentials not found in memory. Make sure you are in the orbiter (not loading screen) and Warframe has been running for a few minutes.".into())
+}
 
+#[cfg(not(target_os = "windows"))]
+fn scan_warframe_credentials_sync() -> Result<(String, String, String), String> {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+
+    let pid = memory_scanner::find_warframe_pid_pub()
+        .ok_or("Warframe is not running")?;
+
+    let mem_path = format!("/proc/{}/mem", pid);
+    let mut mem_file = File::open(&mem_path)
+        .map_err(|e| format!("Cannot open Warframe process memory: {}. Try running with appropriate permissions.", e))?;
+
+    let maps_path = format!("/proc/{}/maps", pid);
+    let maps_str = std::fs::read_to_string(&maps_path)
+        .map_err(|e| format!("Cannot read process maps: {}", e))?;
+
+    for line in maps_str.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 { continue; }
+
+        let addr_range = parts[0];
+        let perms = parts[1];
+        if !perms.starts_with('r') { continue; }
+
+        let mut addr_iter = addr_range.split('-');
+        let start_addr = match addr_iter.next() {
+            Some(s) => match usize::from_str_radix(s, 16) { Ok(v) => v, Err(_) => continue },
+            None => continue,
+        };
+        let end_addr = match addr_iter.next() {
+            Some(s) => match usize::from_str_radix(s, 16) { Ok(v) => v, Err(_) => continue },
+            None => continue,
+        };
+
+        let region_size = end_addr.saturating_sub(start_addr);
+        if region_size < 4096 || region_size > 128 * 1024 * 1024 { continue; }
+
+        if parts.len() >= 6 {
+            let path = parts[5];
+            if path.starts_with("[vvar]") || path.starts_with("[vdso]") || path.starts_with("[vsyscall]") {
+                continue;
+            }
+        }
+
+        let mut buffer = vec![0u8; region_size];
+        let bytes_read = match mem_file.seek(SeekFrom::Start(start_addr as u64)) {
+            Ok(_) => match mem_file.read(&mut buffer) {
+                Ok(n) => n,
+                Err(_) => continue,
+            },
+            Err(_) => continue,
+        };
+
+        if bytes_read == 0 { continue; }
+
+        if let Some((id, nonce)) = memory_scanner::scan_auth_credentials(&buffer[..bytes_read]) {
+            let steam_id = memory_scanner::scan_steam_id(&buffer[..bytes_read]).unwrap_or_default();
+            return Ok((id, nonce, steam_id));
+        }
+    }
+
+    Err("Credentials not found in memory. Make sure you are in the orbiter (not loading screen) and Warframe has been running for a few minutes.".into())
 }
 
 /// Scan Warframe memory for API request URLs — reveals exact endpoints the game uses.
 #[tauri::command]
 async fn scan_warframe_api_urls() -> Result<Vec<String>, String> {
+    #[cfg(not(target_os = "windows"))]
+    { return Err("Memory scanning is only supported on Windows.".into()); }
+    #[cfg(target_os = "windows")]
+    {
     tauri::async_runtime::spawn_blocking(|| {
         use windows_sys::Win32::{
             Foundation::CloseHandle,
@@ -555,6 +635,7 @@ async fn scan_warframe_api_urls() -> Result<Vec<String>, String> {
         }
         Ok(found)
     }).await.map_err(|e| e.to_string())?
+    }
 }
 
 /// Login to Warframe API with email + password (same flow as mobile companion app).
@@ -1181,6 +1262,26 @@ fn wfm_save_credentials(email: String, password: String) -> Result<(), String> {
     if ok == 0 { Err("Failed to save to Windows Credential Manager".into()) } else { Ok(()) }
 }
 
+#[tauri::command]
+#[cfg(not(target_os = "windows"))]
+fn wfm_save_credentials(email: String, password: String) -> Result<(), String> {
+    let data_dir = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("warframe-companion");
+    let _ = std::fs::create_dir_all(&data_dir);
+    let cred_path = data_dir.join("wfm_credentials.json");
+    let json = serde_json::json!({ "email": email, "password": password });
+    std::fs::write(&cred_path, json.to_string())
+        .map_err(|e| format!("Failed to save credentials: {}", e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        let _ = std::fs::set_permissions(&cred_path, perms);
+    }
+    Ok(())
+}
+
 /// Load WFM credentials from Windows Credential Manager.
 #[tauri::command]
 #[cfg(target_os = "windows")]
@@ -1214,6 +1315,29 @@ fn wfm_load_credentials() -> Result<Option<(String, String)>, String> {
     Ok(Some((email, password)))
 }
 
+#[tauri::command]
+#[cfg(not(target_os = "windows"))]
+fn wfm_load_credentials() -> Result<Option<(String, String)>, String> {
+    let data_dir = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("warframe-companion");
+    let cred_path = data_dir.join("wfm_credentials.json");
+    let content = match std::fs::read_to_string(&cred_path) {
+        Ok(s) => s,
+        Err(_) => return Ok(None),
+    };
+    let json: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let email = json["email"].as_str().unwrap_or("").to_string();
+    let password = json["password"].as_str().unwrap_or("").to_string();
+    if email.is_empty() && password.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((email, password)))
+}
+
 /// Delete saved WFM credentials from Windows Credential Manager.
 #[tauri::command]
 #[cfg(target_os = "windows")]
@@ -1223,6 +1347,19 @@ fn wfm_delete_credentials() -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     let target: Vec<u16> = OsStr::new("FrameForge_WFM").encode_wide().chain(Some(0)).collect();
     unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0); }
+    Ok(())
+}
+
+#[tauri::command]
+#[cfg(not(target_os = "windows"))]
+fn wfm_delete_credentials() -> Result<(), String> {
+    let data_dir = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("warframe-companion");
+    let cred_path = data_dir.join("wfm_credentials.json");
+    if cred_path.exists() {
+        let _ = std::fs::remove_file(&cred_path);
+    }
     Ok(())
 }
 
@@ -1725,9 +1862,14 @@ fn parse_original_stats(text: Option<&str>) -> Vec<serde_json::Value> {
 /// Capture the riven reroll screen and OCR the stats + weapon name.
 /// Returns (weapon_name, positives, negatives).
 #[tauri::command]
-async fn ocr_riven_screen() -> Result<serde_json::Value, String> {
+async fn ocr_riven_screen(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let riven_log = std::env::temp_dir().join("frameforge_riven_session.txt");
     let ts1 = chrono::Local::now().format("%H:%M:%S%.3f").to_string();
+    // In-game UI scale (fraction). The riven card shrinks toward screen centre at
+    // lower scales, so the stat crop is centred and scaled to match — same idea as
+    // the relic reward box. Calibrated so 1.0 == the validated crop (x .40–.60,
+    // y .60–.78). Read once up front; never held across an await.
+    let ui_scale = (state.ui_scale_pct.load(Ordering::SeqCst) as f32 / 100.0).clamp(0.5, 1.0);
 
     let _ = append_to_file(&riven_log, &format!(
         "[STEP 2] OCR STARTED — {}\n\
@@ -1754,15 +1896,19 @@ async fn ocr_riven_screen() -> Result<serde_json::Value, String> {
         let riven_log2 = riven_log.clone();
         // One PrintWindow capture; two OCR passes from the same pixels:
         //   • Full width (0–100%) for validation markers ("INVENTORY/MODS" + "FITS IN")
-        //   • Card column only (20–65%) for stat parsing — excludes the right panel whose
-        //     "FITS IN" / weapon label text can interfere with reading the card's bottom stats.
+        //   • A tight, CENTRED crop over just the card's name+stat block for parsing —
+        //     this excludes the bright diorama background that was corrupting OCR. The
+        //     crop is scaled by the in-game UI scale (1.0 → x .40–.60, y .60–.78).
         let attempt_result = tokio::task::spawn_blocking(move || {
             let ts = chrono::Local::now().format("%H:%M:%S%.3f").to_string();
             let px = ocr::capture_warframe_pixels().map_err(|e| format!("Capture: {}", e))?;
             let (pixels, w, h) = px;
             let full_text = ocr::ocr_pixels_rect(&pixels, w, h, 0.0, 1.0, 0.0, 0.82)
                 .unwrap_or_default();
-            let card_text = ocr::ocr_pixels_rect(&pixels, w, h, 0.20, 0.65, 0.28, 0.82)
+            let cy = 0.5 + 0.19 * ui_scale;
+            let hx = 0.10 * ui_scale;
+            let hy = 0.09 * ui_scale;
+            let card_text = ocr::ocr_pixels_rect(&pixels, w, h, 0.5 - hx, 0.5 + hx, cy - hy, cy + hy)
                 .unwrap_or_default();
             let _ = append_to_file(&riven_log2, &format!(
                 "[STEP 2] OCR attempt {} — {}\n├─ Full text:\n{}\n└─ Card text:\n{}\n\n",
@@ -1810,7 +1956,9 @@ async fn ocr_riven_screen() -> Result<serde_json::Value, String> {
 
     // Detect comparison mode: >4 stat lines means two cards are visible (3–4 stats each).
     // A riven can have at most 4 stats (3 pos + 1 neg), so 5+ total implies 2 cards.
-    let stat_line_count = text.lines()
+    // Count from the FULL-WIDTH OCR (covers BOTH cards) — the narrowed single-card
+    // crop only sees the centre and would miss side-by-side comparison cards.
+    let stat_line_count = full_text_for_fallback.lines()
         .filter(|l| { let t = l.trim(); t.starts_with('+') || t.starts_with('-') })
         .count();
     let is_comparison = stat_line_count > 4;
@@ -1829,7 +1977,10 @@ async fn ocr_riven_screen() -> Result<serde_json::Value, String> {
         let cols = tokio::task::spawn_blocking(move || {
             match ocr::capture_warframe_pixels() {
                 Ok((px, w, h)) => {
-                    // Wider y range to catch element-icon stat lines near card bottom
+                    // Comparison: original (left) + new roll (right), side by side.
+                    // Left at the original wide bands — the single-card test images don't
+                    // cover comparison layout, so we don't blind-shrink it here. Sizing
+                    // this down needs a comparison-mode reference capture.
                     let left  = ocr::ocr_pixels_rect(&px, w, h, 0.18, 0.44, 0.25, 0.84).unwrap_or_default();
                     let right = ocr::ocr_pixels_rect(&px, w, h, 0.44, 0.68, 0.25, 0.84).unwrap_or_default();
                     let _ = append_to_file(&riven_log3, &format!(
@@ -2053,47 +2204,85 @@ async fn ocr_riven_screen() -> Result<serde_json::Value, String> {
     }))
 }
 
-/// Start a lightweight EE.log watcher for features that don't need the memory scanner:
-/// riven reroll detection, trade completion detection, WFM whisper detection.
+/// Resolve the active EE.log for the lightweight watcher. Uses the same
+/// cross-platform discovery the monitor uses (LocalAppData on Windows, Proton /
+/// Steam prefixes on Linux): first existing candidate, else the first candidate
+/// as a best guess so the watcher can keep retrying until Warframe creates it.
+fn resolve_ee_log_for_watcher() -> Option<std::path::PathBuf> {
+    let candidates = log_parser::get_ee_log_candidates();
+    candidates
+        .iter()
+        .find(|p| p.exists())
+        .cloned()
+        .or_else(|| candidates.into_iter().next())
+}
+
+/// Start a lightweight EE.log watcher for riven reroll / screen-close detection.
 /// Called unconditionally at app startup — EE.log is plain file I/O, not memory reading.
+/// (WFM whisper and trade-completion detection are handled by start_monitor's EE.log
+/// tail, so they are intentionally NOT duplicated here.)
 #[tauri::command]
 fn start_log_watcher(app: tauri::AppHandle) -> Result<(), String> {
-    let log_path = dirs::data_local_dir()
-        .map(|d| d.join("Warframe").join("EE.log"))
-        .ok_or("Cannot find LocalAppData")?;
-
     std::thread::spawn(move || {
         use std::io::{Read, Seek, SeekFrom};
-        let mut file_pos: u64 = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
-        let mut pending_trade: Option<String> = None;
-        // Cooldown: don't fire riven-screen-open again within 4 seconds of the last fire.
-        // Guards against the same EE.log buffer being processed twice by React StrictMode listeners.
+
+        let mut log_path = resolve_ee_log_for_watcher();
+        let mut file_pos: u64 = log_path
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .unwrap_or(0);
+        // Cooldown: don't fire riven detection again within 4 seconds of the last fire.
         let mut last_riven_fire: Option<std::time::Instant> = None;
 
-        // Use FindFirstChangeNotificationW so we wake up the instant EE.log is written,
-        // instead of sleeping and polling. This is how Overwolf achieves low latency.
-        let change_handle: isize = {
+        // Windows: wake the instant EE.log's directory is written via
+        // FindFirstChangeNotificationW. Linux has no portable equivalent, so it
+        // polls on a short sleep — the same approach start_monitor uses.
+        #[cfg(target_os = "windows")]
+        let (change_handle, use_notify) = {
             use windows_sys::Win32::Storage::FileSystem::{
                 FindFirstChangeNotificationW, FILE_NOTIFY_CHANGE_LAST_WRITE,
             };
-            let dir = log_path.parent().unwrap_or(std::path::Path::new("."));
+            let dir = log_path
+                .as_ref()
+                .and_then(|p| p.parent())
+                .map(|d| d.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
             let dir_wide: Vec<u16> = dir.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
-            unsafe { FindFirstChangeNotificationW(dir_wide.as_ptr(), 0, FILE_NOTIFY_CHANGE_LAST_WRITE) }
+            let h = unsafe { FindFirstChangeNotificationW(dir_wide.as_ptr(), 0, FILE_NOTIFY_CHANGE_LAST_WRITE) };
+            (h, h != -1) // -1 = INVALID_HANDLE_VALUE
         };
-        let use_notify = change_handle != -1; // -1 = INVALID_HANDLE_VALUE
 
         loop {
-            if use_notify {
+            // The log may be absent (Warframe not running, or wrong best-guess on
+            // Linux multi-library setups) — re-discover it until it appears.
+            if log_path.as_ref().map_or(true, |p| !p.exists()) {
+                log_path = resolve_ee_log_for_watcher();
+                if log_path.as_ref().map_or(true, |p| !p.exists()) {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    continue;
+                }
+                file_pos = 0;
+            }
+            let Some(path) = log_path.clone() else { continue };
+
+            #[cfg(target_os = "windows")]
+            {
                 use windows_sys::Win32::System::Threading::WaitForSingleObject;
                 use windows_sys::Win32::Storage::FileSystem::FindNextChangeNotification;
-                // Block until EE.log directory has a write — then process immediately
-                unsafe { WaitForSingleObject(change_handle, 500); } // 500ms safety timeout
-                unsafe { FindNextChangeNotification(change_handle); }
-            } else {
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                if use_notify {
+                    // Block until EE.log directory has a write — then process immediately
+                    unsafe { WaitForSingleObject(change_handle, 500); } // 500ms safety timeout
+                    unsafe { FindNextChangeNotification(change_handle); }
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
             }
-            let Ok(mut f) = std::fs::File::open(&log_path) else { continue };
-            let len = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+            #[cfg(not(target_os = "windows"))]
+            std::thread::sleep(std::time::Duration::from_millis(50));
+
+            let Ok(mut f) = std::fs::File::open(&path) else { continue };
+            let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             if len < file_pos { file_pos = 0; }
             if len == file_pos { continue; } // nothing new since last read
             if f.seek(SeekFrom::Start(file_pos)).is_err() { continue; }
@@ -2103,111 +2292,47 @@ fn start_log_watcher(app: tauri::AppHandle) -> Result<(), String> {
             if buf.is_empty() { continue; }
             let lower = buf.to_lowercase();
 
-            // ── Riven reroll / unveil ─────────────────────────────────────────
-            let riven_trigger =
-                lower.contains("omegarerollselection.swf") ||
-                lower.contains("samodeusdioramaloaded");
-
-            let cooldown_ok = last_riven_fire
-                .map_or(true, |t| t.elapsed().as_secs() >= 4);
-
-            if riven_trigger && cooldown_ok {
+            // ── Riven reroll screen OPEN ───────────────────────────────────────
+            // The reroll diorama loads with "OmegaRerollSelection.lua: Diorama setup".
+            // We auto-fire riven-screen-open (App.tsx runs the OCR check) instead of
+            // requiring a button press. last_riven_fire doubles as the "diorama seen"
+            // marker that gates the close detector below. A 4s cooldown collapses
+            // duplicate log lines / rapid re-cycles.
+            let riven_open = lower.contains("omegarerollselection.lua: diorama setup");
+            if riven_open {
+                // Debounce the auto-trigger emit by 4s, but re-arm the "diorama seen"
+                // marker on EVERY diorama line (even when the emit is suppressed) so
+                // the close grace below tracks the latest reroll, not a stale open.
+                let emit_open = last_riven_fire.map_or(true, |t| t.elapsed().as_secs() >= 4);
                 last_riven_fire = Some(std::time::Instant::now());
-                let _ = app.emit("riven-screen-open", ());
-                let _ = app.emit("ff-status", "🎲 Riven screen detected");
+                if emit_open {
+                    let riven_log = std::env::temp_dir().join("frameforge_riven_session.txt");
+                    let ts = chrono::Local::now().format("%H:%M:%S%.3f").to_string();
+                    let _ = append_to_file(&riven_log, &format!(
+                        "[STEP 1] OPEN (OmegaRerollSelection.lua: Diorama setup) — {}\n", ts));
+                    let _ = app.emit("riven-screen-open", ());
+                    let _ = app.emit("ff-status", "🎲 Riven screen open — analysing…");
+                }
             }
 
-            // ── Riven screen close — card UI hidden (primary) ─────────────────
-            // DiegeticArtifactCards.lua: DBG: HudVis 0 fires when the mod card
-            // overlay is hidden — the most direct signal the riven screen closed.
-            // Guard: only fire ≥1 s after the open trigger (so open+close in the
-            // same EE.log buffer don't cancel each other out).
-            if lower.contains("digeticartifactcards.lua: dbg: hudvis 0") {
+            // ── Riven reroll screen CLOSE ──────────────────────────────────────
+            // "CancelJobs batchcount 0" reliably follows leaving the reroll screen,
+            // but only counts once the diorama was seen this session (last_riven_fire
+            // is Some). A short grace avoids a false close on the opening frame.
+            if lower.contains("canceljobs batchcount 0") {
                 let riven_active = last_riven_fire.map_or(false, |t| {
                     let e = t.elapsed().as_secs();
-                    e >= 1 && e < 600
+                    e >= 2 && e < 3600
                 });
                 if riven_active {
+                    // Reset so this doesn't fire again until the next diorama setup.
                     last_riven_fire = None;
                     let riven_log = std::env::temp_dir().join("frameforge_riven_session.txt");
                     let ts = chrono::Local::now().format("%H:%M:%S%.3f").to_string();
                     let _ = append_to_file(&riven_log, &format!(
-                        "[STEP 4] CLOSE (DiegeticArtifactCards HudVis 0) — {}\n\n", ts
-                    ));
+                        "[STEP 4] CLOSE (CancelJobs batchcount 0) — {}\n\n", ts));
                     let _ = app.emit("riven-screen-close", ());
                 }
-            }
-
-            // ── Riven screen close — orbiter scene reload (fallback) ──────────
-            // When the player exits the riven screen, the orbiter scene reloads
-            // and creates VolumetricFog render targets. Kept as a fallback in case
-            // the HudVis 0 trigger is missed.
-            if lower.contains("creating render target: /ee/materials/volumetricfog") {
-                let riven_active = last_riven_fire.map_or(false, |t| {
-                    let e = t.elapsed().as_secs();
-                    e >= 3 && e < 600
-                });
-                if riven_active {
-                    last_riven_fire = None;
-                    let riven_log = std::env::temp_dir().join("frameforge_riven_session.txt");
-                    let ts = chrono::Local::now().format("%H:%M:%S%.3f").to_string();
-                    let _ = append_to_file(&riven_log, &format!(
-                        "[STEP 4] CLOSE (VolumetricFog render target = orbiter loaded) — {}\n\n", ts
-                    ));
-                    let _ = app.emit("riven-screen-close", ());
-                }
-            }
-
-            // ── WFM trade whisper ─────────────────────────────────────────────
-            if lower.contains("(warframe.market)") {
-                let raw = buf.as_str();
-                let from = raw.find("@From ").map(|i| &raw[i+6..])
-                    .and_then(|s| s.split(" :").next())
-                    .map(|s| s.trim().to_string()).unwrap_or_else(|| "Unknown".to_string());
-                let item = { let p="want to buy "; let s=" for ";
-                    raw.find(p).and_then(|i| { let r=&raw[i+p.len()..]; r.find(s).map(|j| r[..j].to_string()) })
-                };
-                let price: Option<u64> = raw.find(" for ").and_then(|i| {
-                    let r=&raw[i+5..]; r.find(" platinum").and_then(|j| r[..j].trim().parse().ok())
-                });
-                let _ = app.emit("wfm-whisper", serde_json::json!({
-                    "from": from, "message": raw.trim(), "item": item, "price": price,
-                    "timestamp": chrono::Local::now().format("%H:%M:%S").to_string(),
-                }));
-            }
-
-            // ── In-game trade completion ──────────────────────────────────────
-            if lower.contains("dialog::createokcancel") && lower.contains("you are offering") {
-                pending_trade = Some(buf.clone());
-            }
-            if lower.contains("the trade was successful") {
-                if let Some(ref trade_raw) = pending_trade.clone() {
-                    // (same parsing logic as in start_monitor)
-                    let r = trade_raw.as_str();
-                    let with_player = r.find("will receive from ").and_then(|i| {
-                        let a = &r[i+18..]; a.find(" the following").map(|j| a[..j].trim().to_string())
-                    }).unwrap_or_default();
-                    let offered = r.find("You are offering:").and_then(|i| {
-                        let a=&r[i+17..]; a.find("and will receive from").map(|j| a[..j].trim().to_string())
-                    }).unwrap_or_default();
-                    let received = r.find("the following:").and_then(|i| {
-                        let a=&r[i+14..]; a.find(", title=").map(|j| a[..j].trim().to_string())
-                    }).unwrap_or_default();
-                    let parse_plat = |s: &str| -> i64 { s.find("Platinum x ").and_then(|i| s[i+11..].split(|c: char| !c.is_ascii_digit()).next()).and_then(|n| n.parse().ok()).unwrap_or(0) };
-                    let plat_off = parse_plat(&offered);
-                    let plat_rec = parse_plat(&received);
-                    let (direction, item_name, platinum) = if plat_off > 0 {
-                        ("bought", received.lines().find(|l| !l.trim().is_empty() && !l.to_lowercase().contains("platinum")).map(|l| l.trim().to_string()).unwrap_or_default(), plat_off)
-                    } else {
-                        ("sold", offered.lines().find(|l| !l.trim().is_empty() && !l.to_lowercase().contains("platinum")).map(|l| l.trim().to_string()).unwrap_or_default(), plat_rec)
-                    };
-                    let _ = app.emit("trade-completed", serde_json::json!({
-                        "withPlayer": with_player, "direction": direction,
-                        "itemName": item_name, "quantity": 1, "platinum": platinum,
-                        "timestamp": chrono::Utc::now().to_rfc3339(),
-                    }));
-                }
-                pending_trade = None;
             }
         }
     });
@@ -2249,7 +2374,7 @@ fn riven_screen_status() -> String {
     let status = if fits_in { "open" } else { "closed" };
     let _ = append_to_file(&riven_log, &format!(
         "[POLL {}] inventory=true fits_in={} ocr=\"{}\" → {}\n",
-        ts, fits_in, &preview[..preview.len().min(80)], status
+        ts, fits_in, preview.chars().take(80).collect::<String>(), status
     ));
     status.into()
 }
@@ -2290,7 +2415,7 @@ fn riven_screen_visible() -> bool {
 
     let _ = append_to_file(&riven_log, &format!(
         "[POLL {}] inventory=true fits_in={} ocr=\"{}\"\n",
-        ts, fits_in_visible, &right_preview[..right_preview.len().min(120)]
+        ts, fits_in_visible, right_preview.chars().take(120).collect::<String>()
     ));
 
     fits_in_visible
@@ -2655,10 +2780,16 @@ pub struct WfmPrice {
 }
 
 /// Fetch 48-hour median sell price for a single item from warframe.market.
-/// Tries the slug as-is first, then retries with the Blueprint suffix added or
-/// removed — WFM is inconsistent about whether component blueprints include it.
+/// Tries the bulk snapshot first (instant), then the slug as-is, then retries
+/// with the Blueprint suffix added or removed — WFM is inconsistent about
+/// whether component blueprints include it.
 #[tauri::command]
-fn fetch_wfm_price(url_name: String) -> Result<WfmPrice, String> {
+fn fetch_wfm_price(url_name: String, state: State<AppState>) -> Result<WfmPrice, String> {
+    // Fast path: bulk snapshot (url_name is already a slug; lookup is idempotent).
+    if let Some(p) = bulk_price_lookup(&state, &url_name) {
+        return Ok(WfmPrice { url_name, sell_median: Some(p as f64), buy_median: None });
+    }
+
     let sell_median = wfm_price_for_slug(&url_name).map_err(|e| e)?
         .or_else(|| {
             if url_name.ends_with("_blueprint") {
@@ -2684,13 +2815,41 @@ fn to_wfm_slug(name: &str) -> String {
         .collect()
 }
 
-/// Fetch the 48-hour median sell price for an item by display name.
-/// Results are cached in AppState so the overlay and main window share them.
-/// Returns None when the item is not listed on warframe.market.
-#[tauri::command]
-fn get_item_price(item_name: String, state: State<AppState>) -> Result<Option<u32>, String> {
-    let slug = to_wfm_slug(&item_name);
+/// Look up a price in the bulk snapshot by display name or slug. Tries the
+/// normalized key as-is, then toggles the "_blueprint" suffix (WFM/wfinfo are
+/// inconsistent about whether component blueprints include it). Returns None on
+/// a snapshot miss — callers fall back to a live warframe.market lookup.
+fn bulk_price_lookup(state: &AppState, name: &str) -> Option<u32> {
+    let map = state.wfm_bulk_prices.lock().ok()?;
+    if map.is_empty() {
+        return None;
+    }
+    let key = to_wfm_slug(name);
+    if let Some(&p) = map.get(&key) {
+        return Some(p.round() as u32);
+    }
+    if let Some(stripped) = key.strip_suffix("_blueprint") {
+        if let Some(&p) = map.get(stripped) {
+            return Some(p.round() as u32);
+        }
+    } else {
+        let with_bp = format!("{}_blueprint", key);
+        if let Some(&p) = map.get(&with_bp) {
+            return Some(p.round() as u32);
+        }
+    }
+    None
+}
 
+/// Resolve a single item's plat: bulk snapshot first (instant), then the live
+/// warframe.market /statistics endpoint (rate-limited) on a snapshot miss.
+/// Live results are cached in AppState so the overlay and main window share them.
+fn price_for_name(state: &AppState, item_name: &str) -> Result<Option<u32>, String> {
+    if let Some(p) = bulk_price_lookup(state, item_name) {
+        return Ok(Some(p));
+    }
+
+    let slug = to_wfm_slug(item_name);
     {
         let cache = state.wfm_price_cache.lock().map_err(|e| e.to_string())?;
         if let Some(&cached) = cache.get(&slug) {
@@ -2718,6 +2877,22 @@ fn get_item_price(item_name: String, state: State<AppState>) -> Result<Option<u3
     Ok(price)
 }
 
+/// Fetch the sell price for an item by display name.
+/// Bulk snapshot first; live warframe.market lookup on a snapshot miss.
+/// Returns None when the item is not listed on warframe.market.
+#[tauri::command]
+fn get_item_price(item_name: String, state: State<AppState>) -> Result<Option<u32>, String> {
+    price_for_name(&state, &item_name)
+}
+
+/// Batch price lookup against the bulk snapshot ONLY (no network) — keeps the
+/// reward overlay's first paint instant. Misses return None and are reconciled
+/// later via the live per-item path (get_item_price / fetchRewardPrices).
+#[tauri::command]
+fn get_item_prices(item_names: Vec<String>, state: State<AppState>) -> Vec<Option<u32>> {
+    item_names.iter().map(|n| bulk_price_lookup(&state, n)).collect()
+}
+
 fn wfm_price_for_slug(slug: &str) -> Result<Option<u32>, String> {
     wfm_wait();
     let url = format!("https://api.warframe.market/v1/items/{}/statistics", slug);
@@ -2739,6 +2914,69 @@ fn wfm_price_for_slug(slug: &str) -> Result<Option<u32>, String> {
         }
         Err(_) => Ok(None),
     }
+}
+
+// ─── Bulk price snapshot (wfinfo) ─────────────────────────────────────────────
+// wfinfo-ng's speed trick: download ONE pre-aggregated price file
+// (api.warframestat.us/wfinfo/prices) covering every relic-tradeable item and
+// look prices up locally. This replaces per-item warframe.market /statistics
+// calls on the reward/Market hot path, so plat resolves as fast as ducats.
+
+const WFINFO_PRICES_URL: &str = "https://api.warframestat.us/wfinfo/prices/";
+
+/// Download and normalize the bulk price snapshot into slug → custom_avg (plat).
+fn download_bulk_prices() -> Result<HashMap<String, f32>, String> {
+    let json: serde_json::Value = ureq::get(WFINFO_PRICES_URL)
+        .call()
+        .map_err(|e| format!("bulk prices: {}", e))?
+        .into_json()
+        .map_err(|e| format!("bulk prices parse: {}", e))?;
+
+    let arr = json.as_array().ok_or("bulk prices: response is not an array")?;
+    let mut map = HashMap::with_capacity(arr.len());
+    for row in arr {
+        let name = match row["name"].as_str() {
+            Some(n) => n,
+            None => continue,
+        };
+        // custom_avg arrives as a stringified float ("79.7"); tolerate a raw number too.
+        let avg = row["custom_avg"].as_str()
+            .and_then(|s| s.parse::<f32>().ok())
+            .or_else(|| row["custom_avg"].as_f64().map(|f| f as f32));
+        if let Some(a) = avg {
+            map.insert(to_wfm_slug(name), a);
+        }
+    }
+    Ok(map)
+}
+
+/// Load the persisted slug → plat snapshot from disk (already normalized).
+fn load_bulk_prices_cache(path: &PathBuf) -> HashMap<String, f32> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Background loop: refresh the bulk snapshot, persist it to disk, and swap it
+/// into the shared map. Runs immediately on launch (after disk hydration) and
+/// every few hours after. The snapshot is small (~66 KB / ~730 items).
+fn spawn_bulk_price_refresh(map: Arc<Mutex<HashMap<String, f32>>>, cache_path: PathBuf) {
+    std::thread::spawn(move || loop {
+        match download_bulk_prices() {
+            Ok(fresh) if !fresh.is_empty() => {
+                if let Ok(json) = serde_json::to_string(&fresh) {
+                    let _ = std::fs::write(&cache_path, json);
+                }
+                if let Ok(mut guard) = map.lock() {
+                    *guard = fresh;
+                }
+            }
+            Ok(_) => {} // empty payload — keep whatever we already have
+            Err(e) => eprintln!("[FF prices] bulk refresh failed: {}", e),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(3 * 60 * 60));
+    });
 }
 
 // ─── Change log ───────────────────────────────────────────────────────────────
@@ -3028,9 +3266,12 @@ pub struct InventoryUpdate {
 
 #[tauri::command]
 async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    log_parser::debug_log("start_monitor invoked");
     if state.monitor_active.swap(true, Ordering::SeqCst) {
+        log_parser::debug_log("start_monitor: already running, returning");
         return Ok(()); // already running
     }
+    log_parser::debug_log("start_monitor: starting monitor threads");
     // Capture the Tokio runtime handle while we're in the async context.
     // The monitoring thread (std::thread::spawn) has no COM/WinRT, so all OCR
     // calls are routed through spawn_blocking which runs on Tokio's thread pool
@@ -3621,9 +3862,18 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
     // Void Fissure reward selection screen becomes active.  All open-source
     // tools (WFInfo, warframeocr, Sentinel) use this string as their trigger.
     // We tail the log file instead of relying on fragile OCR gate heuristics.
-    let ee_log_path = dirs::data_local_dir()
-        .map(|d| d.join("Warframe").join("EE.log"))
-        .filter(|p| p.exists());
+    // Find the active EE.log: user override first, then auto-discovery.
+    let ee_log_path = state.ee_log_override.lock().unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|p| p.exists())
+        .cloned()
+        .or_else(|| log_parser::get_ee_log_candidates()
+            .into_iter()
+            .find(|p| p.exists()));
+    log_parser::debug_log(&format!(
+        "start_monitor: ee_log_path = {}",
+        ee_log_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "NOT FOUND".to_string())
+    ));
 
     // Shared flag: true while the reward screen is active according to EE.log
     let reward_screen_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3636,6 +3886,10 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
     let shared_squad_size: std::sync::Arc<std::sync::Mutex<Option<usize>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
     let shared_squad_size2 = std::sync::Arc::clone(&shared_squad_size);
+
+    // Shared UI-scale percent: set from settings via set_ui_scale, read by the OCR
+    // loop each attempt so reward-card geometry tracks the in-game UI scale.
+    let ee_ui_scale = state.ui_scale_pct.clone();
 
     // ── EE.log watcher → AlecaFrame-style OCR trigger ────────────────────────
     //
@@ -3650,6 +3904,7 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
     let session_log_path = std::env::temp_dir().join("frameforge_overlay_session.txt");
 
     if let Some(log_path) = ee_log_path {
+        log_parser::debug_log(&format!("EE.log watcher: tailing {}", log_path.display()));
         let flag = reward_flag.clone();
         std::thread::spawn(move || {
             let mut file_pos: u64 = std::fs::metadata(&log_path)
@@ -3915,6 +4170,11 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                 let has_trigger = lower.contains("projectionrewardchoice.lua: relic rewards initialized")
                     || lower.contains("openvoidprojectionrewardscreen")
                     || vp_seq_completed;
+                if has_trigger {
+                    log_parser::debug_log(&format!(
+                        "EE.log trigger detected (vp_seq={})", vp_seq_completed
+                    ));
+                }
                 vp_seq_completed = false; // consume the flag
 
                 // Dismiss: "Relic reward screen shut down" fires when the player selects
@@ -3967,6 +4227,15 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                 let trigger_allowed = !has_dismiss
                     && active_since.is_none()
                     && last_dismiss_at.map_or(true, |t| t.elapsed().as_secs() >= 60);
+                if has_trigger {
+                    log_parser::debug_log(&format!(
+                        "EE.log trigger_allowed={} (has_dismiss={} active_since={} cooldown={})",
+                        trigger_allowed,
+                        has_dismiss,
+                        active_since.is_some(),
+                        last_dismiss_at.map_or(99u64, |t| t.elapsed().as_secs())
+                    ));
+                }
                 if has_trigger && trigger_allowed {
                     reward_screen_active2.store(true, Ordering::SeqCst);
                     active_since = Some(std::time::Instant::now());
@@ -4016,37 +4285,63 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                     let slog       = session_log_path.clone();
                     let active     = reward_screen_active2.clone();
                     let squad_arc  = std::sync::Arc::clone(&shared_squad_size);
-                    // Do NOT write ee_squad_size here. The mutex is already reset to None
-                    // when GetVoidProjectionRewards fires (above), and is updated to the
-                    // correct squad count when the sequence completes (line ~3395).
-                    // Writing ee_squad_size here would corrupt the mutex if the sequence
-                    // completed in this same poll (the per-line loop runs before this code).
+                    let ui_scale_arc = std::sync::Arc::clone(&ee_ui_scale);
+                    // Squad size is reset to None when GetVoidProjectionRewards fires and
+                    // set when the sequence completes (see shared_squad_size2 above), so we
+                    // do NOT reset it here — doing so could clobber a value the per-line
+                    // loop already populated in this same poll.
 
                     tauri::async_runtime::spawn(async move {
                         let deadline = std::time::Instant::now()
                             + std::time::Duration::from_secs(45);
-                        // 500ms initial delay — gives cards time to finish fading in and
-                        // allows the VoidProjections EE.log sequence to arrive before the
-                        // first OCR attempt reads hint_squad (race-condition fix).
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        // Anchor for the squad-hint grace window (see the lock gate
+                        // below). The EE.log VoidProjections sequence — which yields
+                        // the authoritative card count (one reward per squad member) —
+                        // usually completes BEFORE the screen trigger, but can land a
+                        // few seconds late. We give it this long to arrive before
+                        // letting the double-confirmation lock a possibly-undercounted
+                        // result.
+                        let loop_start = std::time::Instant::now();
+                        const SQUAD_HINT_GRACE_MS: u64 = 1500;
+                        // 800ms initial delay — enough for the cards to fade in far
+                        // enough to read, while leaving the player time to actually pick.
+                        // A still-fading first capture is harmless now: the double-
+                        // confirmation below won't lock until two captures agree, so an
+                        // early partial just gets superseded by the next pass.
+                        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
 
                         // Allow the catalog to be rebuilt inside the loop — it may be empty
                         // when start_monitor fired before WFCD data finished loading.
                         let mut cat = cat;
                         let mut attempt = 0u32;
                         let mut best_item_count = 0usize;
-                        let mut best_payload: Option<serde_json::Value> = None; // locked when complete
-                        // When no EE squad hint is available, the first "complete" result may
-                        // undercount cards (e.g. dark text hides a 2-line item name).
-                        // soft_complete_at tracks the first attempt that returned complete-without-hint
-                        // so we do one extra retry before locking.
-                        let mut soft_complete_at: Option<usize> = None;
-                        // Item count at the time soft_complete_at was set.
-                        // If the follow-up attempt finds no more items, emit best_payload even if
-                        // a newly-arrived EE hint raised estimated_cards above the count we saw.
-                        // (Warframe can show fewer unique cards than squad size when players share
-                        // the same relic reward — one player lacking reactant is another example.)
-                        let mut soft_complete_count: usize = 0;
+                        let mut best_payload: Option<serde_json::Value> = None;
+                        // ── Repeat-scan majority vote ─────────────────────────────
+                        // Every COMPLETE read casts a vote for its sorted item-set. The
+                        // overlay opens once any reading reaches VOTES_TO_OPEN (2) agreeing
+                        // captures, then keeps scanning for up to MAX_REPEATS_AFTER_OPEN
+                        // (10) more passes, live-updating to whichever reading has the most
+                        // votes so far. This makes a single bad OCR read unable to win, and
+                        // lets a late-rendering card correct the display after it opens.
+                        const VOTES_TO_OPEN: usize = 2;
+                        const MAX_REPEATS_AFTER_OPEN: u32 = 10;
+                        let mut overlay_opened = false;
+                        let mut displayed_key: Option<Vec<String>> = None;
+                        let mut repeats_after_open = 0u32;
+                        let mut vote_counts: std::collections::HashMap<Vec<String>, usize> =
+                            std::collections::HashMap::new();
+                        let mut vote_payload: std::collections::HashMap<Vec<String>, serde_json::Value> =
+                            std::collections::HashMap::new();
+                        // Accumulate per-column words across OCR attempts.
+                        // When OCR is inconsistent, a base name visible in Attempt 2
+                        // but garbled in Attempt 13 can still help identify the item.
+                        let col_words_acc: std::sync::Arc<
+                            std::sync::Mutex<std::collections::HashMap<
+                                usize, std::collections::HashSet<String>
+                            >>
+                        > = std::sync::Arc::new(std::sync::Mutex::new(
+                            std::collections::HashMap::new()
+                        ));
                         loop {
                             attempt += 1;
                             // Rebuild catalog if WFCD hadn't loaded when this OCR session started.
@@ -4083,93 +4378,122 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                             }
                             let _ = app.emit("ff-status", "📷 OCR scanning...");
                             let cat2 = std::sync::Arc::clone(&cat);
-                            // Clone the Arc so the hint can be read inside spawn_blocking.
-                            // Reading AFTER capture (~100-400 ms) rather than before gives the
-                            // EE.log VoidProjections sequence time to complete and write the
-                            // correct squad count before we decide how many columns to use.
-                            let squad_arc2 = std::sync::Arc::clone(&squad_arc);
+                            // Read squad size fresh for each attempt — it may arrive after
+                            // the first attempt if VoidProjections sequence completes late.
+                            let hint_squad = squad_arc.lock().ok().and_then(|g| *g);
+                            // UI scale as a fraction (1.0 = 100%); drives reward-card geometry.
+                            let ui_scale = ui_scale_arc.load(Ordering::SeqCst) as f32 / 100.0;
+                            let acc_clone = std::sync::Arc::clone(&col_words_acc);
                             let result = tauri::async_runtime::spawn_blocking(move || {
                                 let (pixels, w, cap_h, full_h, cap_info) =
                                     ocr::capture_warframe_reward_area()?;
-                                // Read hint AFTER capture — the sequence may have completed
-                                // during the PrintWindow/DXGI call.
-                                let hint_squad = squad_arc2.lock().ok().and_then(|g| *g);
+                                let mut acc_lock = acc_clone.lock().ok()?;
                                 Some(ocr::extract_reward_items_twophase(
                                     &pixels, w, cap_h, full_h, &cat2, &cap_info, hint_squad,
+                                    ui_scale,
+                                    Some(&mut *acc_lock),
                                 ))
                             }).await.ok().flatten();
-                            // Re-read hint for confirm_ready logic below (same mutex, post-capture value).
-                            let hint_squad = squad_arc.lock().ok().and_then(|g| *g);
+                            // (Post-capture squad-hint re-read removed: the vote-based
+                            // confirmation below no longer gates on the squad count.)
 
                             let ts = chrono::Local::now().format("%H:%M:%S%.3f");
                             let sleep_ms = match &result {
                                 // ✅ 1+ items found (solo=1, duo=2, trio=3, full squad=4)
                                 Some((complete, _, ref items, ref positions, ref dbg)) if !items.is_empty() => {
-                                    let payload = Some(serde_json::json!({
-                                        "items": items, "positions": positions
-                                    }));
+                                    // Resolve each matched unique-name to its catalog DISPLAY name.
+                                    // The overlay (and the main-process enricher) join on the display
+                                    // name because the recipe-component path we match on is often
+                                    // absent from get_all_items (blueprints are deduped to their
+                                    // ExportRecipes path), whereas the name is always present.
+                                    let names: Vec<String> = items.iter().map(|u|
+                                        cat.iter().find(|(k, _)| k == u)
+                                            .map(|(_, n)| n.clone())
+                                            .unwrap_or_else(|| u.clone())
+                                    ).collect();
+                                    let payload = serde_json::json!({
+                                        "items": items, "positions": positions, "names": names
+                                    });
 
-                                    // Determine whether this complete result should be locked now.
-                                    // If we have an EE squad hint the count is authoritative.
-                                    // If we don't (hint arrived late or solo/friend group),
-                                    // do one extra retry first — a dark/fading card may have been
-                                    // missed and the prime/forma word count underestimates 2-line names.
-                                    let confirm_ready = hint_squad.is_some() || soft_complete_at.is_some();
+                                    // Sorted item-set is the vote key (order-independent multiset).
+                                    let cur_key: Vec<String> = {
+                                        let mut v = items.clone(); v.sort(); v
+                                    };
 
-                                    // Save best result; only emit to overlay when confirmed (LOCK).
-                                    // Partial updates are intentionally suppressed — emitting
-                                    // partial data while the user is still hovering cards causes
-                                    // the overlay to flicker with wrong items between attempts.
+                                    // Track the best result for the status line / timeout fallback.
                                     if items.len() > best_item_count {
                                         best_item_count = items.len();
-                                        best_payload = payload.clone();
-                                        let label = if *complete && confirm_ready { "✅" } else { "⚡" };
-                                        let status_label = if *complete && confirm_ready { "locked" }
-                                            else if *complete { "soft-complete, confirming" }
-                                            else { "waiting" };
-                                        let _ = app.emit("ff-status",
-                                            format!("{} {} items ({})", label, items.len(), status_label));
-                                        let result_label = if *complete && confirm_ready { "LOCKED & emitting" }
-                                            else if *complete { "soft-complete, retrying once" }
-                                            else { "saved, retrying" };
-                                        let session_entry = format!(
+                                        best_payload = Some(payload.clone());
+                                    }
+
+                                    // Only COMPLETE reads vote (the full expected card count is
+                                    // present). Hold a short settle window so a late-rendering card
+                                    // has time to appear before the overlay opens.
+                                    if *complete {
+                                        *vote_counts.entry(cur_key.clone()).or_insert(0) += 1;
+                                        vote_payload.insert(cur_key.clone(), payload.clone());
+                                    }
+                                    let settled = loop_start.elapsed()
+                                        >= std::time::Duration::from_millis(SQUAD_HINT_GRACE_MS);
+
+                                    // Majority reading = most votes so far. On a tie we keep the
+                                    // currently-displayed reading (prevents flip-flopping); else
+                                    // pick deterministically.
+                                    let max_votes = vote_counts.values().copied().max().unwrap_or(0);
+                                    let displayed_has_max = displayed_key.as_ref()
+                                        .and_then(|k| vote_counts.get(k)).copied().unwrap_or(0) == max_votes
+                                        && max_votes > 0;
+                                    let majority: Option<Vec<String>> = if displayed_has_max {
+                                        displayed_key.clone()
+                                    } else if max_votes > 0 {
+                                        vote_counts.iter()
+                                            .filter(|(_, &n)| n == max_votes)
+                                            .map(|(k, _)| k.clone())
+                                            .min()
+                                    } else {
+                                        None
+                                    };
+
+                                    if !overlay_opened {
+                                        // ── Phase A: open once a reading has 2 confirming votes ──
+                                        let ready = settled && max_votes >= VOTES_TO_OPEN;
+                                        let status_label = if ready { "confirmed" }
+                                            else if *complete { "verifying" } else { "scanning" };
+                                        let _ = app.emit("ff-status", format!("{} {} items ({})",
+                                            if ready { "✅" } else { "⚡" }, items.len(), status_label));
+                                        let _ = append_to_file(&slog, &format!(
                                             "[STEP 2] OCR ATTEMPT #{}\n\
                                              ├─ Time     : {}\n\
                                              {}\n\
-                                             └─ RESULT   : {} items found → {}\n\
+                                             └─ RESULT   : {} items, votes={} → {}\n\
                                              └─ Items    : {:?}\n\n{}",
-                                            attempt, ts, dbg, items.len(),
-                                            result_label,
+                                            attempt, ts, dbg, items.len(), max_votes,
+                                            if ready { "CONFIRMED (2 matching reads) → LOCKED & opening overlay" }
+                                            else if *complete { "complete — awaiting a 2nd matching read" }
+                                            else { "partial — retrying" },
                                             items,
-                                            if *complete && confirm_ready { "[STEP 3] OVERLAY OPENED\n\n" } else { "" }
-                                        );
-                                        let _ = append_to_file(&slog, &session_entry);
+                                            if ready { "[STEP 3] OVERLAY OPENED\n\n" } else { "" }
+                                        ));
                                         let _ = std::fs::write(&lpath, format!(
                                             "=== {} ===\nItems: {:?}\n{}\n", ts, items, dbg));
-                                    }
 
-                                    // Stop retrying and emit ONLY when all expected cards found AND confirmed.
-                                    if *complete {
-                                        if confirm_ready {
-                                            // Hard cutoff: if dismiss arrived while OCR was running, drop the result.
+                                        if ready {
+                                            // Hard cutoff: drop the result if dismiss arrived mid-OCR.
                                             if !active.load(Ordering::SeqCst) { break; }
-                                            // Log the confirming attempt when item count didn't improve
-                                            // (the logging block above only fires when items.len() > best_item_count).
-                                            if items.len() <= best_item_count {
-                                                let _ = append_to_file(&slog, &format!(
-                                                    "[STEP 2] OCR ATTEMPT #{} (confirm)\n\
-                                                     ├─ Time     : {}\n\
-                                                     └─ {} items — same as before, confirmed\n\n\
-                                                     [STEP 3] OVERLAY OPENED\n\n",
-                                                    attempt, ts, items.len()
-                                                ));
-                                            }
-                                            let _ = app.emit("relic-rewards", &payload);
+                                            let open_key = majority.clone().unwrap_or_else(|| cur_key.clone());
+                                            let open_payload = vote_payload.get(&open_key)
+                                                .cloned().unwrap_or_else(|| payload.clone());
+                                            log_parser::debug_log(&format!(
+                                                "OCR emitting relic-rewards with {} items",
+                                                open_payload["items"].as_array().map(|a| a.len()).unwrap_or(0)));
+                                            let _ = app.emit("relic-rewards", &open_payload);
+                                            overlay_opened = true;
+                                            displayed_key = Some(open_key);
+
+                                            // 20s safety auto-dismiss (normal close is EE.log pick).
                                             let app2 = app.clone();
                                             let slog2 = slog.clone();
                                             tauri::async_runtime::spawn(async move {
-                                                // 20s safety fallback — normally the overlay closes
-                                                // when EE.log fires "relic timer closed" (player picks).
                                                 tokio::time::sleep(std::time::Duration::from_secs(20)).await;
                                                 let _ = app2.emit("relic-rewards", serde_json::Value::Null);
                                                 if let Some(w) = app2.get_webview_window("relic-overlay") {
@@ -4178,49 +4502,52 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                                                 let _ = append_to_file(&slog2,
                                                     "[STEP 4] AUTO-DISMISS (20s safety fallback)\n\n");
                                             });
-                                            break;
-                                        } else {
-                                            // First complete without an EE hint — mark and retry once.
-                                            soft_complete_at = Some(attempt as usize);
-                                            soft_complete_count = best_item_count;
+                                            // Do NOT break — keep scanning to refine via majority vote.
                                         }
-                                    } else if soft_complete_at.is_some() && items.len() <= soft_complete_count {
-                                        // Soft-complete confirmation retry found no more items.
-                                        // A late EE hint may have raised estimated_cards above what
-                                        // the screen actually shows (e.g. squad=4 but only 3 unique
-                                        // cards because one player lacked reactant or shared a reward).
-                                        // Emit best_payload now rather than retrying until timeout.
-                                        if !active.load(Ordering::SeqCst) { break; }
-                                        let emit_val = best_payload.clone().unwrap_or(serde_json::Value::Null);
-                                        let _ = app.emit("relic-rewards", &emit_val);
-                                        let _ = append_to_file(&slog,
-                                            "[STEP 3] OVERLAY OPENED (soft-complete confirmed — no improvement)\n\n");
-                                        let app2 = app.clone();
-                                        let slog2 = slog.clone();
-                                        tauri::async_runtime::spawn(async move {
-                                            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
-                                            let _ = app2.emit("relic-rewards", serde_json::Value::Null);
-                                            if let Some(w) = app2.get_webview_window("relic-overlay") {
-                                                let _ = w.close();
+                                        // Tight confirm cadence.
+                                        200u64
+                                    } else {
+                                        // ── Phase B: overlay open — refine by majority vote ──
+                                        repeats_after_open += 1;
+                                        if let Some(maj) = majority.clone() {
+                                            if displayed_key.as_ref() != Some(&maj) {
+                                                let upd = vote_payload.get(&maj)
+                                                    .cloned().unwrap_or_else(|| payload.clone());
+                                                // Distinct event → App.tsx pushes update_overlay_rewards
+                                                // (NOT a second spawn_overlay).
+                                                let _ = app.emit("relic-rewards-update", &upd);
+                                                displayed_key = Some(maj);
+                                                let _ = append_to_file(&slog, &format!(
+                                                    "[STEP 3] OVERLAY UPDATED (repeat #{} — majority shifted to {} items)\n\n",
+                                                    repeats_after_open,
+                                                    upd["items"].as_array().map(|a| a.len()).unwrap_or(0)));
                                             }
-                                            let _ = append_to_file(&slog2,
-                                                "[STEP 4] AUTO-DISMISS (20s safety fallback)\n\n");
-                                        });
-                                        break;
+                                        }
+                                        let _ = app.emit("ff-status", format!("🔁 refining ({}/{}) — {} items",
+                                            repeats_after_open, MAX_REPEATS_AFTER_OPEN, items.len()));
+                                        let _ = std::fs::write(&lpath, format!(
+                                            "=== {} ===\nItems: {:?}\n{}\n", ts, items, dbg));
+
+                                        if repeats_after_open >= MAX_REPEATS_AFTER_OPEN {
+                                            let _ = append_to_file(&slog, &format!(
+                                                "[STEP 3] REFINE COMPLETE — {} repeat scans done; overlay stays until pick/dismiss\n\n",
+                                                repeats_after_open));
+                                            break;
+                                        }
+                                        300u64
                                     }
-                                    // Partial result (or soft-complete pending confirmation) — retry
-                                    400u64
                                 }
                                 // ⬛ Dark/blank frame — PrintWindow returned nearly-black
                                 Some((_, _, _, _, ref dbg)) if dbg.starts_with("dark-frame") => {
+                                    let debug_bmp = std::env::temp_dir().join("frameforge_capture_debug.bmp");
                                     let entry = format!(
                                         "[STEP 2] OCR ATTEMPT #{}\n\
                                          ├─ Time     : {}\n\
-                                         └─ RESULT   : {} → PrintWindow returned dark image\n\
-                                            Check %TEMP%\\frameforge_capture_debug.bmp\n\
+                                         └─ RESULT   : {} → capture returned dark image\n\
+                                            Check: {}\n\
                                             Fix: switch Warframe to Borderless Windowed mode\n\
                                             Retrying in 100ms…\n\n",
-                                        attempt, ts, dbg);
+                                        attempt, ts, dbg, debug_bmp.display());
                                     let _ = append_to_file(&slog, &entry);
                                     let _ = std::fs::write(&lpath,
                                         format!("=== {} ===\n{} — retrying\n", ts, dbg));
@@ -4229,13 +4556,14 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                                 }
                                 // ⬜ OCR ran but returned no text
                                 Some((_, _, _, _, ref dbg)) if dbg.starts_with("ocr-empty") => {
+                                    let debug_bmp = std::env::temp_dir().join("frameforge_capture_debug.bmp");
                                     let entry = format!(
                                         "[STEP 2] OCR ATTEMPT #{}\n\
                                          ├─ Time     : {}\n\
                                          └─ RESULT   : {} → image has content but OCR found no text\n\
-                                            Check %TEMP%\\frameforge_capture_debug.bmp\n\
+                                            Check: {}\n\
                                             Retrying in 300ms…\n\n",
-                                        attempt, ts, dbg);
+                                        attempt, ts, dbg, debug_bmp.display());
                                     let _ = append_to_file(&slog, &entry);
                                     let _ = std::fs::write(&lpath,
                                         format!("=== {} ===\n{} — retrying\n", ts, dbg));
@@ -4248,14 +4576,14 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                                         "[STEP 2] OCR ATTEMPT #{}\n\
                                          ├─ Time     : {}\n\
                                          {}\n\
-                                         └─ RESULT   : no catalog match (catalog={}) → retrying in 700ms\n\n",
+                                         └─ RESULT   : no catalog match (catalog={}) → retrying in 400ms\n\n",
                                         attempt, ts, dbg, cat_len);
                                     let _ = append_to_file(&slog, &entry);
                                     let _ = std::fs::write(&lpath, format!(
                                         "=== {} ===\nno match (catalog={}): {:?}\n{}\n",
                                         ts, cat_len, items, dbg));
                                     let _ = app.emit("ff-status", "❌ No catalog match, retrying...");
-                                    700u64
+                                    400u64
                                 }
                                 // ⚠️ Warframe window not found
                                 None => {
@@ -4274,14 +4602,18 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                             };
 
                             if std::time::Instant::now() >= deadline {
-                                // Emit best partial result if we found anything, otherwise null.
-                                // This means even a timeout shows something rather than nothing
-                                // when OCR found cards but couldn't reach the expected count.
-                                let emit_val = if active.load(Ordering::SeqCst) {
-                                    best_payload.unwrap_or(serde_json::Value::Null)
-                                } else {
-                                    serde_json::Value::Null
-                                };
+                                 // Emit best partial result if we found anything, otherwise null.
+                                 // This means even a timeout shows something rather than nothing
+                                 // when OCR found cards but couldn't reach the expected count.
+                                 // If the overlay is already open (refine phase ran long), emit
+                                 // null instead — a non-null relic-rewards would spawn a SECOND
+                                 // subprocess; live refinements go through relic-rewards-update.
+                                 let emit_val = if active.load(Ordering::SeqCst) && !overlay_opened {
+                                     best_payload.unwrap_or(serde_json::Value::Null)
+                                 } else {
+                                     serde_json::Value::Null
+                                 };
+                                log_parser::debug_log(&format!("OCR timeout emitting relic-rewards (active={})", active.load(Ordering::SeqCst)));
                                 let _ = app.emit("relic-rewards", &emit_val);
                                 let _ = append_to_file(&slog,
                                     "[STEP 2] OCR TIMEOUT — 45 seconds elapsed, emitting best result\n\n");
@@ -5260,13 +5592,30 @@ fn capture_diagnostics(state: State<'_, AppState>) -> Result<String, String> {
     Ok(folder.to_string_lossy().into_owned())
 }
 
+/// Return the platform-specific path where the overlay session log is written.
+#[tauri::command]
+fn get_overlay_session_log_path() -> String {
+    std::env::temp_dir().join("frameforge_overlay_session.txt").to_string_lossy().to_string()
+}
+
 /// Returns the Warframe game CLIENT AREA as [x, y, width, height] in screen pixels.
 /// Uses GetClientRect + ClientToScreen so the rect matches what the OCR captures —
 /// both exclude the window title bar and borders in windowed mode.
 #[tauri::command]
 fn get_warframe_window_rect() -> Result<[i32; 4], String> {
     #[cfg(not(target_os = "windows"))]
-    { return Err("Windows only".into()); }
+    {
+        let windows = xcap::Window::all().map_err(|e| e.to_string())?;
+        let warframe = windows.into_iter().find(|w| {
+            w.title().map(|t| t.to_lowercase().contains("warframe")).unwrap_or(false)
+        }).ok_or("Warframe window not found")?;
+
+        let x = warframe.x().map_err(|e| e.to_string())?;
+        let y = warframe.y().map_err(|e| e.to_string())?;
+        let w = warframe.width().map_err(|e| e.to_string())?;
+        let h = warframe.height().map_err(|e| e.to_string())?;
+        return Ok([x, y, w as i32, h as i32]);
+    }
     #[cfg(target_os = "windows")]
     {
         use windows_sys::Win32::Foundation::{POINT, RECT};
@@ -5287,6 +5636,48 @@ fn get_warframe_window_rect() -> Result<[i32; 4], String> {
     }
 }
 
+/// Float the in-process riven overlay above a fullscreen game on Linux using the
+/// same EWMH + compositor keep-above hints as the relic overlay. Unlike the relic
+/// overlay this window stays interactive (buttons), so it is NOT made click-through.
+/// No-op on Windows (the native always-on-top window already floats correctly).
+#[tauri::command]
+fn make_riven_overlay_floating(app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        let window = app
+            .get_webview_window("riven-overlay")
+            .ok_or("riven-overlay window not found")?;
+        let compositor = overlay_linux::detect_compositor();
+
+        // X11 window id (raw-window-handle v0.6) for targeted xprop calls.
+        let x11_id: Option<u64> = {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            window.window_handle().ok().and_then(|h| match h.as_raw() {
+                RawWindowHandle::Xlib(x) => Some(x.window),
+                RawWindowHandle::Xcb(x)  => Some(x.window.get() as u64),
+                _                         => None,
+            })
+        };
+
+        // Apply on a short delay (the XWayland window must be mapped before xprop
+        // hints stick), then re-apply once after the compositor settles. The riven
+        // overlay is interactive, so we deliberately do NOT set ignore_cursor_events.
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let _ = window.set_always_on_top(true);
+            overlay_linux::apply_x11_hints(x11_id, "FrameForge Riven", compositor);
+            overlay_linux::apply_compositor_hooks(compositor, x11_id, "FrameForge Riven");
+
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            let _ = window.set_always_on_top(true);
+            overlay_linux::apply_x11_hints(x11_id, "FrameForge Riven", compositor);
+        });
+    }
+    #[cfg(target_os = "windows")]
+    { let _ = app; }
+    Ok(())
+}
+
 #[tauri::command]
 fn stop_monitor(state: State<AppState>) {
     state.monitor_active.store(false, Ordering::SeqCst);
@@ -5295,6 +5686,40 @@ fn stop_monitor(state: State<AppState>) {
 #[tauri::command]
 fn get_monitor_status(state: State<AppState>) -> bool {
     state.monitor_active.load(Ordering::SeqCst)
+}
+
+/// Set the in-game Warframe UI scale (fraction, e.g. 0.75 = 75%). Clamped to the
+/// supported 0.5–1.0 range and stored as an integer percent for the OCR loop.
+#[tauri::command]
+fn set_ui_scale(state: State<AppState>, scale: f32) {
+    let pct = (scale * 100.0).round().clamp(50.0, 100.0) as u32;
+    state.ui_scale_pct.store(pct, Ordering::SeqCst);
+}
+
+#[tauri::command]
+async fn get_ee_log_path(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    // Check user override first
+    if let Some(override_path) = state.ee_log_override.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if override_path.exists() {
+            log_parser::debug_log(&format!("EE.log override active: {}", override_path.display()));
+            return Ok(Some(override_path.to_string_lossy().to_string()));
+        }
+    }
+    // Fall back to auto-discovery (fast — only direct paths, no recursion)
+    tokio::task::spawn_blocking(|| log_parser::get_default_log_path())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_ee_log_path(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let path_buf = PathBuf::from(&path);
+    if !path_buf.exists() {
+        return Err(format!("Path does not exist: {}", path));
+    }
+    *state.ee_log_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(path_buf);
+    log_parser::debug_log(&format!("EE.log override set to: {}", path));
+    Ok(())
 }
 
 /// Returns blueprint_path → display_name map (names only, for compatibility).
@@ -5532,6 +5957,7 @@ pub fn run() {
     let relic_rewards_cache_path = data_dir.join("relic_rewards_cache.json");
     let quantities_cache_path = data_dir.join("quantities_cache.json");
     let inventory_state_cache_path = data_dir.join("inventory_state_cache.json");
+    let prices_snapshot_cache_path = data_dir.join("wfinfo_prices_cache.json");
     let settings_path = data_dir.join("settings.json");
     let log_path = data_dir.join("scan_log.txt");
     let changes_log_path = data_dir.join("inventory_changes.txt");
@@ -5561,6 +5987,11 @@ pub fn run() {
     let initial_syndicate_catalog: HashMap<String, Vec<SyndicateOffer>> = std::fs::read_to_string(&syndicate_catalog_path)
         .ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
 
+    // Bulk price snapshot: hydrate from disk instantly, then refresh in the
+    // background so reward/Market plat is available the moment the app opens.
+    let bulk_prices = Arc::new(Mutex::new(load_bulk_prices_cache(&prices_snapshot_cache_path)));
+    spawn_bulk_price_refresh(bulk_prices.clone(), prices_snapshot_cache_path.clone());
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
@@ -5571,6 +6002,7 @@ pub fn run() {
             relic_rewards_cache_path,
             quantities_cache_path,
             inventory_state_cache_path,
+            prices_snapshot_cache_path,
             settings_path,
             log_path,
             changes_log_path,
@@ -5594,7 +6026,10 @@ pub fn run() {
             raw_scan_path,
             blob_log_enabled: Arc::new(AtomicBool::new(false)),
             blob_log_dir,
+            ui_scale_pct: Arc::new(AtomicU32::new(100)),
+            ee_log_override: Mutex::new(None),
             wfm_price_cache: Mutex::new(HashMap::new()),
+            wfm_bulk_prices: bulk_prices,
             wfm_session: Arc::new(Mutex::new(None)),
             wfm_top_cache_path,
             syndicate_catalog: Mutex::new(initial_syndicate_catalog),
@@ -5648,6 +6083,7 @@ pub fn run() {
             fetch_wfm_price,
             get_wfm_top_items,
             get_item_price,
+            get_item_prices,
             wfm_set_status,
             start_log_watcher,
             ocr_riven_log_error,
@@ -5693,11 +6129,19 @@ pub fn run() {
             get_warframe_window_rect,
             get_overlay_session_log,
             capture_diagnostics,
+            get_overlay_session_log_path,
             start_monitor,
             stop_monitor,
             get_monitor_status,
+            set_ui_scale,
+            get_ee_log_path,
+            set_ee_log_path,
             get_blueprint_names,
             get_current_crafting,
+            spawn_overlay,
+            dismiss_overlay,
+            update_overlay_rewards,
+            make_riven_overlay_floating,
         ])
         .on_window_event(|window, event| {
             let label = window.label().to_string();
@@ -5734,4 +6178,340 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// Overlay subprocess entry point.
+/// Creates a minimal Tauri app that hosts a single transparent XWayland overlay window.
+/// Reads reward data from the file pointed to by FRAMEFORGE_OVERLAY_PAYLOAD.
+/// The compositor type is read from FRAMEFORGE_COMPOSITOR (set by the parent process)
+/// so we can run the right compositor IPC after the window is mapped.
+#[cfg(not(target_os = "windows"))]
+pub fn run_overlay() {
+    let _ = std::fs::write(std::env::temp_dir().join("frameforge_overlay_alive"), "alive");
+    eprintln!("[FF overlay] run_overlay started");
+
+    let payload_path = std::env::var(overlay_linux::ENV_OVERLAY_PAYLOAD)
+        .unwrap_or_else(|_| std::env::temp_dir()
+            .join("frameforge_overlay_payload.json")
+            .to_string_lossy().to_string());
+
+    let payload: overlay_linux::OverlayPayload = std::fs::read_to_string(&payload_path)
+        .ok().and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| overlay_linux::OverlayPayload {
+            items:           vec![],
+            positions:       vec![],
+            win_w:           1920,
+            win_h:           1080,
+            priority:        "completion".into(),
+            dismiss_path:    std::env::temp_dir()
+                .join("frameforge_overlay_dismiss")
+                .to_string_lossy().to_string(),
+            kwin_script:     false,
+            scanner_enabled: false,
+            rewards:         serde_json::Value::Null,
+            ui_scale:        1.0,
+        });
+
+    eprintln!("[FF overlay] payload: {} items, win={}x{}", payload.items.len(), payload.win_w, payload.win_h);
+
+    // The parent encoded the compositor as a plain Debug string ("Kde", "Sway", …)
+    let compositor = overlay_linux::compositor_from_env();
+    eprintln!("[FF overlay] compositor: {:?}", compositor);
+
+    let dismiss_path = payload.dismiss_path.clone();
+
+    tauri::Builder::default()
+        // Hand-written invoke handler for the overlay subprocess.
+        //
+        // Why not generate_handler!?
+        // #[tauri::command] emits __cmd__<name> macro_rules! into the *crate*
+        // macro namespace, not the module namespace.  Defining stub commands
+        // with the same names as the real commands (get_all_items, etc.) in
+        // overlay_linux.rs causes E0255 duplicate macro definitions at compile
+        // time.  A plain closure has no such restriction and lets us map
+        // command strings to responses directly.
+        //
+        // Overlay.tsx wraps these three calls in Promise.allSettled before it
+        // will render rewards.  They must resolve (even with empty data) or
+        // dataReady is never set and the overlay stays blank forever.
+        // get_item_price / get_recipe are called per-item after render; the
+        // overlay handles their rejection gracefully via .catch(() => null/[]).
+        .invoke_handler(|invoke| {
+            let cmd = invoke.message.command().to_string();
+            let resolver = invoke.resolver;
+            match cmd.as_str() {
+                "get_all_items"
+                | "get_current_crafting"
+                | "get_recipe" => {
+                    resolver.resolve(serde_json::Value::Array(vec![]));
+                    true
+                }
+                "get_current_quantities" => {
+                    resolver.resolve(serde_json::json!({}));
+                    true
+                }
+                "get_item_price" => {
+                    // mirrors Ok(None) from the real command
+                    resolver.resolve(serde_json::Value::Null);
+                    true
+                }
+                "get_item_prices" => {
+                    // Not used in subprocess mode (rewards arrive pre-enriched),
+                    // but stubbed so a shared-resolver call degrades gracefully.
+                    resolver.resolve(serde_json::Value::Array(vec![]));
+                    true
+                }
+                // The overlay subprocess can't fetch file:// from the webview
+                // (WebKitGTK blocks it from the app origin), so the JS side asks
+                // Rust to read the temp payload / enrichment files instead. Rust
+                // file reads have no such restriction. Returns null when absent so
+                // the caller's poll loop simply keeps waiting.
+                "read_overlay_payload" => {
+                    let path = std::env::var(overlay_linux::ENV_OVERLAY_PAYLOAD)
+                        .unwrap_or_else(|_| std::env::temp_dir()
+                            .join("frameforge_overlay_payload.json")
+                            .to_string_lossy().to_string());
+                    let val = std::fs::read_to_string(&path).ok()
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                        .unwrap_or(serde_json::Value::Null);
+                    resolver.resolve(val);
+                    true
+                }
+                "read_overlay_enriched" => {
+                    let path = std::env::temp_dir()
+                        .join("frameforge_overlay_enriched.json");
+                    let val = std::fs::read_to_string(&path).ok()
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                        .unwrap_or(serde_json::Value::Null);
+                    resolver.resolve(val);
+                    true
+                }
+                unknown => {
+                    resolver.reject(format!(
+                        "command '{unknown}' is not available in overlay mode"
+                    ));
+                    true
+                }
+            }
+        })
+        .setup(move |app| {
+            let pri = payload.priority.clone();
+            let scanner = if payload.scanner_enabled { "on" } else { "off" };
+            let url = format!(
+                "index.html?overlay&ww={}&wh={}&priority={}&payload={}&scanner={}&uiscale={}",
+                payload.win_w, payload.win_h, pri, payload_path, scanner, payload.ui_scale
+            );
+            let ww = payload.win_w as f64;
+            let wh = payload.win_h as f64;
+            let strip_y = wh * 0.74;
+            // Cards anchor at top:40px and grow downward; a 2-line item name plus
+            // the set section makes the tallest card ~245px. 0.22*wh (237px @1080p)
+            // clipped that by a few pixels, so the card's bottom border was cut off.
+            // 0.25*wh (270px @1080p) contains it with margin and the band bottom
+            // still lands at 0.99*wh — on-screen. strip_y is unchanged, so the cards
+            // stay exactly where they were; this only adds room below.
+            let strip_h = wh * 0.25;
+
+            // The tauri.conf.json "windows" array creates a default "main" window even
+            // in overlay mode. Close it immediately so only the overlay is visible.
+            // We create the overlay window FIRST so there's always ≥1 window open
+            // (preventing Tauri from exiting between the close and the create).
+            eprintln!("[FF overlay] building webview window: url={}", url);
+            let window = tauri::WebviewWindowBuilder::new(
+                app,
+                "relic-overlay",
+                tauri::WebviewUrl::App(url.into()),
+            )
+            .title("FrameForge Overlay")
+            .transparent(true)
+            .decorations(false)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .resizable(false)
+            .focused(false)
+            .shadow(false)
+            .inner_size(ww, strip_h)
+            .position(0.0, strip_y)
+            .visible(true)
+            .build()
+            .map_err(|e| {
+                eprintln!("[FF overlay] window build failed: {e}");
+                e.to_string()
+            })?;
+            eprintln!("[FF overlay] window created successfully");
+
+            // Stop the overlay grabbing focus the instant it maps. tao's
+            // .focused(false) is not enough on XWayland — the WM still focuses the
+            // freshly-mapped window for a beat (the user saw the game lose input
+            // until the overlay rendered). GTK's focus_on_map(false) is the real fix:
+            // it maps the window WITHOUT requesting focus. We set it here, before the
+            // event loop maps the window, so it takes effect on the very first map.
+            // accept_focus(false) also keeps it from ever taking keyboard focus (the
+            // relic overlay is click-through and needs no input).
+            {
+                use gtk::prelude::GtkWindowExt;
+                if let Ok(gtk_win) = window.gtk_window() {
+                    gtk_win.set_accept_focus(false);
+                    gtk_win.set_focus_on_map(false);
+                }
+            }
+
+            // Force physical-pixel position.
+            // On XWayland the WebviewWindowBuilder's position() may interpret
+            // coordinates as logical (HiDPI-scaled), placing the strip at the
+            // wrong Y. set_position with PhysicalPosition is always in raw pixels.
+            let _ = window.set_position(tauri::PhysicalPosition::new(0i32, strip_y as i32));
+            let _ = window.show();
+            // Enable click-through immediately — XWayland honours X11 input shapes,
+            // which Tauri sets through the Xfixes extension here.
+            let _ = window.set_ignore_cursor_events(true);
+
+            // Belt-and-suspenders for focus: the relic overlay is click-through and
+            // must NEVER hold focus, but on XWayland the WM (and WebKitGTK on first
+            // paint) can still hand it focus for a beat during init — which steals
+            // input from the game until the user clicks back. Whenever the overlay
+            // gains focus, immediately hand it back to Warframe, so the player never
+            // loses input. (focus_on_map(false) above prevents most of this; this
+            // catches whatever slips through, regardless of cause/timing.)
+            window.on_window_event(|event| {
+                if let tauri::WindowEvent::Focused(true) = event {
+                    std::thread::spawn(overlay_linux::refocus_warframe);
+                }
+            });
+
+            // Close the default "main" window that tauri.conf.json creates.
+            // Without this the subprocess would show a second FrameForge window
+            // alongside the overlay, making it appear as if the main app closed
+            // and reopened when the subprocess exits.
+            if let Some(main_win) = app.get_webview_window("main") {
+                let _ = main_win.close();
+            }
+
+            // The webview pulls its reward data via the read_overlay_payload /
+            // read_overlay_enriched invoke commands (Rust-side file reads). We no
+            // longer emit a bare {items, positions} "relic-rewards" event here:
+            // that event carried no display names / prices / components, so when
+            // the old file:// fetch failed the overlay fell back to it and rendered
+            // raw path tails ("XakuPrimeBlueprint") with no set data. The invoke
+            // path supplies the fully-enriched rewards instead.
+
+            // Grab the X11 window ID (raw-window-handle v0.6) for targeted xprop calls.
+            let x11_id: Option<u64> = {
+                use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                window.window_handle().ok().and_then(|h| match h.as_raw() {
+                    RawWindowHandle::Xlib(x) => Some(x.window),
+                    RawWindowHandle::Xcb(x)  => Some(x.window.get() as u64),
+                    _                         => None,
+                })
+            };
+
+            // Apply the focus-prevention + always-on-top hints IMMEDIATELY, before
+            // the WM finishes mapping the window. Properties set now are read by the
+            // WM on map, so the overlay never grabs keyboard focus from the game (the
+            // old code only applied them at t+300ms — after the WM had already focused
+            // it, which is why the user had to click back on Warframe).
+            overlay_linux::apply_x11_hints(x11_id, "FrameForge Overlay", compositor);
+
+            // Apply all overlay properties in a background thread.
+            // Two rounds of EWMH hints + compositor IPC are fired:
+            //   t+300ms  — first attempt (window is usually mapped by then)
+            //   t+900ms  — re-apply in case the compositor reset them on focus change
+            // Each round also returns focus to Warframe, in case the WM still grabbed
+            // it during the map despite the hints above.
+            let window_clone = window.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+
+                // Round 1 — EWMH hints + compositor IPC
+                let _ = window_clone.set_ignore_cursor_events(true);
+                overlay_linux::apply_x11_hints(x11_id, "FrameForge Overlay", compositor);
+                overlay_linux::apply_compositor_hooks(compositor, x11_id, "FrameForge Overlay");
+                overlay_linux::refocus_warframe();
+
+                // Round 2 — re-enforce after compositor has had a chance to settle
+                std::thread::sleep(std::time::Duration::from_millis(600));
+                let _ = window_clone.set_always_on_top(true);
+                let _ = window_clone.set_ignore_cursor_events(true);
+                overlay_linux::apply_x11_hints(x11_id, "FrameForge Overlay", compositor);
+                overlay_linux::refocus_warframe();
+            });
+
+            // Poll for dismiss signal and auto-close after 20 s
+            let app_handle2 = app.app_handle().clone();
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_secs(20);
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    if std::fs::metadata(&dismiss_path).is_ok() { break; }
+                    if std::time::Instant::now() > deadline      { break; }
+                }
+                if let Some(w) = app_handle2.get_webview_window("relic-overlay") {
+                    let _ = w.close();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::process::exit(0);
+            });
+
+            Ok(())
+        })
+        .run(tauri::generate_context!())
+        .unwrap_or_else(|e| {
+            eprintln!("[FF overlay] Tauri app error: {e}");
+            panic!("error while running overlay");
+        });
+}
+
+#[cfg(target_os = "windows")]
+pub fn run_overlay() {
+    // Windows overlay runs in-process via the main app; no subprocess needed.
+    eprintln!("run_overlay() should not be called on Windows");
+}
+
+/// Spawn the overlay as an XWayland subprocess.
+///
+/// This is the universal path for all Linux compositors. The old
+/// "KDE Native" Wayland-window branch has been removed because:
+///   - Wayland has no standard protocol for input-transparent windows
+///   - XWayland + EWMH hints works reliably across KDE, Sway, Hyprland, X11
+/// The subprocess itself calls overlay_linux::apply_compositor_hooks() after
+/// its window is mapped to run compositor-specific IPC (KWin D-Bus, swaymsg,
+/// hyprctl) in addition to the EWMH hints.
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+fn spawn_overlay(payload: overlay_linux::OverlayPayload) -> Result<overlay_linux::OverlayMethod, String> {
+    overlay_linux::spawn_overlay_subprocess(&payload)?;
+    Ok(overlay_linux::OverlayMethod::Subprocess)
+}
+
+#[cfg(target_os = "windows")]
+#[derive(serde::Serialize, Clone)]
+pub enum OverlayMethod { Native, Subprocess, LayerShell }
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
+fn spawn_overlay(_payload: serde_json::Value) -> Result<OverlayMethod, String> {
+    Ok(OverlayMethod::Native)
+}
+
+/// Signal the overlay subprocess to close.
+#[tauri::command]
+fn dismiss_overlay() {
+    #[cfg(not(target_os = "windows"))]
+    overlay_linux::signal_overlay_dismiss();
+}
+
+/// Push price-enriched reward items to the running overlay.
+///
+/// The overlay is spawned immediately with network-free local data (names,
+/// ducats, owned counts, component lists) so it appears instantly. warframe.market
+/// prices are rate-limited and can take a moment, so the main process fetches them
+/// afterwards and calls this to write an enrichment file the overlay polls. Writing
+/// to a temp file is the only channel available — the overlay is a separate process
+/// with no shared Tauri state.
+#[tauri::command]
+fn update_overlay_rewards(rewards: serde_json::Value) -> Result<(), String> {
+    let path = std::env::temp_dir().join("frameforge_overlay_enriched.json");
+    std::fs::write(&path, serde_json::to_string(&rewards).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())
 }

@@ -120,14 +120,14 @@ function SetCard({ setKey, parts, parentItem, setPrice, setPriceLoading, pricesF
           {hasDupes && <span className="mset-badge mset-dupes">+ Dupes</span>}
         </div>
         <div className="market-set-price-box">
-          {setPriceLoading ? (
-            <span className="market-price-spin">…</span>
-          ) : setPrice?.sell_median ? (
+          {setPrice?.sell_median ? (
             <div className="market-set-price">
               <PlatIcon size={16} />
               <span className="market-price-big">{fmtPt(setPrice.sell_median)}</span>
               <span className="market-price-lbl">set</span>
             </div>
+          ) : setPriceLoading ? (
+            <span className="market-price-spin">…</span>
           ) : pricesFetched ? (
             <span className="market-price-na">—</span>
           ) : null}
@@ -151,7 +151,7 @@ function SetCard({ setKey, parts, parentItem, setPrice, setPriceLoading, pricesF
               <span className="mpart-sep">/</span>
               <PlatIcon size={12} />
               <span className="mpart-plat-val">
-                {part.loading ? "…" : part.sellMedian ? fmtPt(part.sellMedian) : "—"}
+                {part.sellMedian ? fmtPt(part.sellMedian) : part.loading ? "…" : "—"}
               </span>
               <span className="mpart-sep">/</span>
               <span className="mpart-name">{partLabel(part.item.name, setKey)}</span>
@@ -448,6 +448,44 @@ export default function MarketHelper({ quantities, apiQuantities, refreshKey, cr
     run();
     return () => { cancelled = true; };
   }, [wfmLookup.size, fetchOnePrice]); // eslint-disable-line
+
+  // One-shot instant fill from the bulk price snapshot: a single batch call
+  // resolves every set + part slug from the in-memory snapshot (wfinfo), so plat
+  // shows the moment the grid opens instead of trickling in. The continuous loop
+  // above still runs afterwards to refine misses and refresh over time.
+  const bulkFilledRef = useRef(false);
+  useEffect(() => {
+    if (bulkFilledRef.current || sets.size === 0) return;
+
+    const slugs: string[] = [];
+    const seen = new Set<string>();
+    for (const [key, parts] of sets) {
+      const setUrl = wfmLookup.get(normalizeForWfm(key + " Set")) ?? normalizeForWfm(key + " Set");
+      if (!seen.has(setUrl)) { seen.add(setUrl); slugs.push(setUrl); }
+      for (const p of parts) {
+        const u = wfmLookup.get(normalizeForWfm(p.name)) ?? normalizeForWfm(p.name);
+        if (!seen.has(u)) { seen.add(u); slugs.push(u); }
+      }
+    }
+    if (slugs.length === 0) return;
+    bulkFilledRef.current = true;
+
+    invoke<(number | null)[]>("get_item_prices", { itemNames: slugs })
+      .then(vals => {
+        const now = Date.now();
+        setPrices(prev => {
+          const next = new Map(prev);
+          slugs.forEach((u, i) => { if (vals[i] != null) next.set(u, { url_name: u, sell_median: vals[i]! }); });
+          return next;
+        });
+        setPriceAges(prev => {
+          const next = new Map(prev);
+          slugs.forEach((u, i) => { if (vals[i] != null) next.set(u, now); });
+          return next;
+        });
+      })
+      .catch(() => { bulkFilledRef.current = false; });
+  }, [sets, wfmLookup]);
 
   const visibleSets = useMemo(() => {
     const q = search.toLowerCase();

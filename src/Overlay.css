@@ -18,7 +18,7 @@ body { background: transparent !important; margin: 0; overflow: hidden; }
 /* ─── Pick arrow ─────────────────────────────────────────────────────────── */
 .ov-arrow {
   position: absolute;
-  top: 2px;
+  top: 6px;
   width: 36px; height: 28px;
   pointer-events: none;
   opacity: 0.65;
@@ -28,7 +28,7 @@ body { background: transparent !important; margin: 0; overflow: hidden; }
 /* ─── Card shell ─────────────────────────────────────────────────────────── */
 .ov-card {
   position: absolute;
-  top: 34px;
+  top: 40px;
   background: rgba(22, 27, 34, 0.82);
   border: 1px solid var(--border);
   border-radius: 8px;

@@ -123,9 +123,8 @@ function LoginPanel({ onLogin }: { onLogin: (u: string) => void }) {
           <div className="wfm-warning-card" onClick={e => e.stopPropagation()}>
             <div className="wfm-warning-title">⚠ About staying logged in</div>
             <ul className="wfm-warning-list">
-              <li>Your <strong>session token</strong> (not your password) is saved to <strong>Windows Credential Manager</strong> — the encrypted OS vault used by Chrome and Windows apps.</li>
+              <li>Your <strong>session token</strong> (not your password) is saved to the OS credential vault (Windows Credential Manager on Windows, or an encrypted local file on Linux).</li>
               <li>Your email and password are <strong>never stored</strong>.</li>
-              <li>Encrypted with your Windows login key.</li>
               <li>Remove it any time using "Forget saved session".</li>
             </ul>
             <div className="wfm-warning-actions">

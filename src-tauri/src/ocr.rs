@@ -273,7 +273,8 @@ pub fn ocr_pixels_rect(
 
     let (enhanced, ew, eh) = preprocess_for_ocr(&cropped, rect_w, rect_h);
     let bmp = to_bmp(&enhanced, ew, eh);
-    run_windows_ocr(bmp, ew, eh).map(|(text, _)| text)
+    let _ = eh;
+    run_ocr(bmp, ew).map(|(text, _)| text)
 }
 
 /// OCR a rectangle WITHOUT preprocessing — for white-on-dark text that OCRs fine raw.
@@ -298,7 +299,7 @@ pub fn ocr_pixels_rect_raw(
         cropped[dst..dst + dst_stride].copy_from_slice(&pixels[src..src + dst_stride]);
     }
     let bmp = to_bmp(&cropped, rect_w, rect_h);
-    run_windows_ocr(bmp, rect_w, rect_h).map(|(text, _)| text)
+    run_ocr(bmp, rect_w).map(|(text, _)| text)
 }
 
 /// Convenience: capture + OCR a vertical strip of the window (full width).
@@ -575,7 +576,7 @@ pub fn to_bmp(pixels_bgra: &[u8], width: u32, height: u32) -> Vec<u8> {
 /// Run Windows.Media.Ocr on a BMP. Returns (full_text, line_positions).
 /// line_positions: Vec<(line_text, x_frac)> — X centre per line from word bounding rects.
 #[cfg(target_os = "windows")]
-pub fn run_windows_ocr(bmp: Vec<u8>, img_w: u32, img_h: u32) -> Result<(String, Vec<(String, f32, f32)>), String> {
+pub fn run_ocr(bmp: Vec<u8>, img_w: u32) -> Result<(String, Vec<(String, f32)>), String> {
     // Ensure COM is initialized for this thread. Tokio spawn_blocking threads
     // start without a COM apartment; WinRT calls fail or return empty silently.
     // CoInitializeEx returns S_OK (first init), S_FALSE (already MTA), or
@@ -595,7 +596,7 @@ pub fn run_windows_ocr(bmp: Vec<u8>, img_w: u32, img_h: u32) -> Result<(String, 
         Storage::Streams::{DataWriter, InMemoryRandomAccessStream},
     };
 
-    (|| -> windows::core::Result<(String, Vec<(String, f32, f32)>)> {
+    (|| -> windows::core::Result<(String, Vec<(String, f32)>)> {
         let stream = InMemoryRandomAccessStream::new()?;
         let writer = DataWriter::CreateDataWriter(&stream)?;
         writer.WriteBytes(&bmp)?;
@@ -616,34 +617,28 @@ pub fn run_windows_ocr(bmp: Vec<u8>, img_w: u32, img_h: u32) -> Result<(String, 
         let result = engine.RecognizeAsync(&bitmap)?.get()?;
 
         let mut full = String::new();
-        let mut lines_out: Vec<(String, f32, f32)> = Vec::new();
+        let mut lines_out: Vec<(String, f32)> = Vec::new();
         let lines: IVectorView<OcrLine> = result.Lines()?;
         let count = lines.Size()?;
         for i in 0..count {
             let line = lines.GetAt(i)?;
             let text = line.Text()?.to_string();
-            // Compute average word centre X and Y, normalised to [0,1].
-            // Both are needed: X drives column assignment; Y filters out
-            // screen-top HUD overlays (FPS counters, GPU widgets) that would
-            // otherwise create spurious x-clusters and inflate the card count.
-            let (x_frac, y_frac) = (|| -> windows::core::Result<(f32, f32)> {
+            // Try word bounding rects for X position; fall back to 0.5 if unavailable
+            let x_frac = (|| -> windows::core::Result<f32> {
                 let words = line.Words()?;
                 let wc = words.Size()?;
-                if wc == 0 { return Ok((0.5, 0.5)); }
-                let (mut sx, mut sy) = (0.0f32, 0.0f32);
+                if wc == 0 || img_w == 0 { return Ok(0.5); }
+                let mut sum = 0.0f32;
                 for j in 0..wc {
                     let w = words.GetAt(j)?;
                     let r = w.BoundingRect()?;
-                    sx += r.X + r.Width  / 2.0;
-                    sy += r.Y + r.Height / 2.0;
+                    sum += r.X + r.Width / 2.0;
                 }
-                let x = if img_w > 0 { (sx / wc as f32) / img_w as f32 } else { 0.5 };
-                let y = if img_h > 0 { (sy / wc as f32) / img_h as f32 } else { 0.5 };
-                Ok((x, y))
-            })().unwrap_or((0.5, 0.5));
+                Ok((sum / wc as f32) / img_w as f32)
+            })().unwrap_or(0.5);
             full.push_str(&text);
             full.push('\n');
-            lines_out.push((text, x_frac, y_frac));
+            lines_out.push((text, x_frac));
         }
         Ok((full, lines_out))
     })().map_err(|e| e.to_string())
@@ -712,7 +707,9 @@ fn word_found_in_set(
             let len_diff = (catalog_word.len() as isize - ocr_w.len() as isize).unsigned_abs();
             if dist <= max_dist && !(len_diff == dist && len_diff >= 2) { return true; }
         }
-        // Sliding window (merged tokens — e.g. OCR reads "SevagothPrime" as one word)
+        // Sliding window (merged tokens — e.g. OCR reads "SevagothPrime" as one word).
+        // The suffix guard below (win_start>=3 exact-suffix) rejects a short base name
+        // matching the tail of a longer different word — e.g. "gara" inside "akjagara".
         let ob = ocr_w.as_bytes();
         if ob.len() >= wb.len() {
             for (win_start, win) in ob.windows(wb.len()).enumerate() {
@@ -765,11 +762,10 @@ fn normalise(s: &str) -> String {
 /// band have bar-coloured pixels. Columns that are consistently orange or teal
 /// across many rows score high. This is far more robust than row-by-row detection
 /// because it tolerates thin bars, color gradients, and single-row noise.
-#[cfg(target_os = "windows")]
 /// Returns `(Some((centers, bar_y_frac)), diagnostic_string)`.
 /// `centers` are fractions of image width — the diamond icon X per card.
 /// The diagnostic string is always populated for session log inclusion.
-fn find_rarity_bars(pixels: &[u8], pix_w: u32, pix_h: u32) -> (Option<(Vec<f32>, f32)>, String) {
+fn find_rarity_bars(pixels: &[u8], pix_w: u32, pix_h: u32, ui_scale: f32) -> (Option<(Vec<f32>, f32)>, String) {
     let x_lo = (pix_w as f32 * 0.05) as u32;
     let x_hi = (pix_w as f32 * 0.95) as u32;
     // Bars are at ~89% of captured height (bottom edge of the card area).
@@ -840,9 +836,10 @@ fn find_rarity_bars(pixels: &[u8], pix_w: u32, pix_h: u32) -> (Option<(Vec<f32>,
     let col_threshold = (max_col / 4).max(2);
     let mut lit: Vec<bool> = col_score.iter().map(|&s| s >= col_threshold).collect();
 
-    // Bridge tiny dark notches within one arrow (≤1 % of scan width).
+    // Bridge tiny dark notches within one arrow (≤1 % of scan width at 100% UI).
+    // The arrow narrows with UI scale, so the bridge width does too.
     // Inter-card gaps are ~10 % of scan width and will NOT be bridged.
-    let bridge = (scan_w / 100).max(3);
+    let bridge = (((scan_w as f32 / 100.0) * ui_scale) as usize).max((3.0 * ui_scale) as usize).max(1);
     {
         let mut xi = 0;
         while xi < scan_w {
@@ -860,9 +857,10 @@ fn find_rarity_bars(pixels: &[u8], pix_w: u32, pix_h: u32) -> (Option<(Vec<f32>,
     }
 
     // Each continuous lit segment = one rarity bar = one reward card.
-    // The rarity indicator is a small downward-pointing arrow (~30 px wide at 1080p).
-    // min_band = 0.7% of scan width — passes arrows of ~10 px and above.
-    let min_band = (scan_w / 150).max(6);
+    // The rarity indicator is a small downward-pointing arrow (~30 px wide at 1080p,
+    // 100% UI). Both the arrow width and the minimum band shrink with UI scale.
+    // min_band ≈ 0.7% of scan width — passes arrows of ~10 px and above.
+    let min_band = (((scan_w as f32 / 150.0) * ui_scale) as usize).max((6.0 * ui_scale) as usize).max(1);
     let mut bands: Vec<(usize, usize)> = Vec::new();
     let mut in_band = false;
     let mut band_start = 0usize;
@@ -886,10 +884,25 @@ fn find_rarity_bars(pixels: &[u8], pix_w: u32, pix_h: u32) -> (Option<(Vec<f32>,
         ));
     }
     if bands.len() > 4 {
-        return (None, format!(
-            "no bars — {} segments after bridging (expected 1–4); max_col={}, threshold={}",
-            bands.len(), max_col, col_threshold
-        ));
+        // Salvage instead of discarding: on dark frames the diorama / weapon art
+        // produces spurious lit segments alongside the real rarity bars. Real bars
+        // are sharp, strongly-lit columns; rank bands by peak column score, drop the
+        // ones far weaker than the strongest, then cap at 4. Discarding all geometry
+        // (the old behaviour) collapsed a 2-card screen to a single hardcoded centre.
+        let peak = |b: &(usize, usize)| (b.0..b.1).map(|xi| col_score[xi]).max().unwrap_or(0);
+        let top = bands.iter().map(|b| peak(b)).max().unwrap_or(0);
+        let cutoff = (top as f32 * 0.55) as u32;
+        bands.retain(|b| peak(b) >= cutoff);
+        if bands.len() > 4 {
+            bands.sort_by_key(|b| std::cmp::Reverse(peak(b)));
+            bands.truncate(4);
+            bands.sort_by_key(|b| b.0); // restore left→right order
+        }
+        if bands.is_empty() {
+            return (None, format!(
+                "no bars — salvage emptied (max_col={}, threshold={})", max_col, col_threshold
+            ));
+        }
     }
 
     // ── Step 3: Bar Y position (for icon classifier) ─────────────────────────
@@ -939,11 +952,6 @@ fn find_rarity_bars(pixels: &[u8], pix_w: u32, pix_h: u32) -> (Option<(Vec<f32>,
     (Some((centers, bar_y)), diag)
 }
 
-#[cfg(not(target_os = "windows"))]
-fn find_rarity_bars(_: &[u8], _: u32, _: u32) -> (Option<(Vec<f32>, f32)>, String) {
-    (None, "not supported on non-Windows".into())
-}
-
 // ─── Icon component classifier ────────────────────────────────────────────────
 
 /// What the card icon looks like, used to constrain catalog matching.
@@ -986,7 +994,6 @@ pub enum IconType {
 ///   ⑧ blade        — low symmetry, moderate aspect (flat asymmetric part)
 ///   ⑨ upper/lower limb — low fill, arc-shaped (bow components)
 ///   Unknown        — ambiguous; fall back to text-only matching
-#[cfg(target_os = "windows")]
 fn classify_card_icon(
     pixels: &[u8], pix_w: u32, pix_h: u32,
     x_left: f32, x_right: f32, bar_y: f32,
@@ -1123,11 +1130,6 @@ fn classify_card_icon(
     IconType::Unknown
 }
 
-#[cfg(not(target_os = "windows"))]
-fn classify_card_icon(_: &[u8], _: u32, _: u32, _: f32, _: f32, _: f32) -> IconType {
-    IconType::Unknown
-}
-
 /// Given a word set from OCR text, extract the most likely item NAME
 /// (strip known non-name words: "prime", "blueprint", component names, "owned", etc.)
 fn extract_item_name_words(words: &std::collections::HashSet<String>) -> Vec<String> {
@@ -1148,28 +1150,30 @@ fn extract_item_name_words(words: &std::collections::HashSet<String>) -> Vec<Str
 /// which produce centers that are bunched together or out of range.
 /// Valid 4-card centers span ~0.52 (e.g. 0.24→0.76); false-positive clusters
 /// span much less (e.g. 0.372→0.706 = 0.334, seen with forma-heavy rewards).
-fn bar_centers_are_valid(centers: &[f32]) -> bool {
+fn bar_centers_are_valid(centers: &[f32], ui_scale: f32) -> bool {
     let n = centers.len();
     if n == 0 { return false; }
-    // Outermost centers must be in a plausible screen zone
+    // Outermost centers must be in a plausible screen zone. At lower UI scale the
+    // cards cluster toward centre, so this only ever needs to stay inside [0.15,0.85].
     if centers[0] < 0.15 || centers[n - 1] > 0.85 { return false; }
     if n < 2 { return true; }
-    // Reject if any two adjacent bars are closer than 0.08.
-    // The expected gap between cards is ~0.17 (4-card layout).
-    // Bars within 0.08 of each other are a double-detection of the same bar
+    // Reject if any two adjacent bars are closer than the expected gap. The gap
+    // shrinks linearly with UI scale, so the "double detection" floor does too.
+    // Bars within this of each other are a double-detection of the same bar
     // or a false positive from card artwork — they'd leave one column with no
     // OCR text and another column absorbing text from two cards at once.
     for pair in centers.windows(2) {
-        if pair[1] - pair[0] < 0.08 { return false; }
+        if pair[1] - pair[0] < 0.08 * ui_scale { return false; }
     }
     let span = centers[n - 1] - centers[0];
-    // Expected spans per card count (measured from real captures)
-    let expected = match n {
+    // Expected spans per card count (measured from real captures at 100% UI),
+    // scaled down for smaller in-game UI.
+    let expected = (match n {
         2 => 0.34f32,
         3 => 0.46,
         _ => 0.52, // 4 cards
-    };
-    (span - expected).abs() < 0.10
+    }) * ui_scale;
+    (span - expected).abs() < 0.10 * ui_scale
 }
 
 /// Evenly-distributed card X centers (fraction of image width) for N cards.
@@ -1183,6 +1187,35 @@ fn hardcoded_card_centers(n: usize) -> Vec<f32> {
         3 => vec![0.37, 0.50, 0.63],
         _ => vec![0.31, 0.44, 0.56, 0.69], // 4 cards (default / full squad)
     }
+}
+
+/// How many distinct X positions a base/identifier word occupies in the OCR.
+/// Each prime set sits on ONE physical card, so its base word (e.g. "atlas")
+/// appears at one X cluster. Used to cap same-set duplicates: if matching produced
+/// two "atlas" items but "atlas" only appears at one X, the second is a phantom
+/// from a split card. Two players holding different parts of the same set occupy
+/// two well-separated X positions and are correctly counted as two.
+fn base_word_x_clusters(base: &str, ocr_words: &[(String, f32)]) -> usize {
+    if base.len() < 3 { return 1; }
+    let mut xs: Vec<f32> = ocr_words.iter()
+        .filter(|(w, _)| {
+            let n = normalise(w);
+            if n.len() < 3 { return false; }
+            n == base
+                || (base.len() >= 4 && n.starts_with(base))
+                || (n.len() + 1 >= base.len() && lev_dist(&n, base) <= 1)
+        })
+        .map(|(_, x)| *x)
+        .collect();
+    if xs.is_empty() { return 1; }
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut clusters = 1;
+    let mut last = xs[0];
+    for &x in &xs[1..] {
+        if x - last > 0.10 { clusters += 1; }
+        last = x;
+    }
+    clusters
 }
 
 // ─── Matching helpers (standalone fns — no closure capture issues) ────────────
@@ -1203,29 +1236,55 @@ fn score_item(display_name: &str, words: &std::collections::HashSet<String>) -> 
     let norm = normalise(display_name);
     let item_words: Vec<&str> = norm.split_whitespace().collect();
     if item_words.is_empty() { return 0.0; }
-    let n = item_words.len() as f32;
-    let matched = item_words.iter()
-        .filter(|&&w| word_found_in_set(w, words))
-        .count();
-    let base = matched as f32 / n;
 
-    // Length-affinity bonus for unmatched words.
-    // OCR almost always preserves word length (it substitutes chars, not inserts them),
-    // so prefer catalog words whose length is close to the OCR word length.
-    // Max bonus per unmatched word is 0.08/n — always less than one matched word (1/n).
+    // The base name (first word, e.g. "yareli", "gauss", "burston") is the most
+    // distinctive part of the item name.  Generic suffix words like "prime",
+    // "blueprint", "chassis" appear across many items and should contribute less.
+    const GENERIC: &[&str] = &[
+        "prime", "blueprint", "chassis", "systems", "neuroptics",
+        "barrel", "receiver", "blade", "handle", "grip", "stock",
+        "limb", "upper", "lower", "guard", "hilt", "link", "gauntlet",
+        "carapace", "cerebrum", "head", "strike", "boot",
+    ];
+
+    let mut total_weight = 0.0f32;
+    let mut matched_weight = 0.0f32;
+    let mut base_name_missing = false;
+
+    for (idx, &w) in item_words.iter().enumerate() {
+        let weight = if idx == 0 { 3.0 } // base name
+            else if GENERIC.contains(&w) { 0.25 }
+            else { 1.0 };
+        total_weight += weight;
+        if word_found_in_set(w, words) {
+            matched_weight += weight;
+        } else if idx == 0 {
+            base_name_missing = true;
+        }
+    }
+
+    let mut score = if total_weight > 0.0 { matched_weight / total_weight } else { 0.0 };
+
+    // If the distinctive base name is absent, the item is almost certainly wrong.
+    // Cap the score so generic suffix matches alone can't reach the 0.75 threshold.
+    if base_name_missing {
+        score = score * 0.3;
+    }
+
+    // Small length-affinity bonus for unmatched words (preserves old tie-breaking).
     let len_bonus: f32 = item_words.iter()
         .filter(|&&w| !word_found_in_set(w, words))
         .map(|&cw| {
             words.iter()
                 .map(|ow| {
                     let diff = (cw.len() as isize - ow.len() as isize).unsigned_abs();
-                    if diff == 0 { 0.08_f32 } else if diff == 1 { 0.04 } else { 0.0 }
+                    if diff == 0 { 0.05_f32 } else if diff == 1 { 0.02 } else { 0.0 }
                 })
                 .fold(0.0_f32, f32::max)
         })
-        .sum::<f32>() / n;
+        .sum::<f32>() / item_words.len() as f32;
 
-    base + len_bonus
+    score + len_bonus
 }
 
 // ─── Reward item extraction ───────────────────────────────────────────────────
@@ -1233,38 +1292,57 @@ fn score_item(display_name: &str, words: &std::collections::HashSet<String>) -> 
 /// Relic reward detection.
 ///
 /// 1. Find rarity bars → card X positions + bar Y (reliable visual anchor).
-/// 2. Full-frame raw OCR → text with line X positions.
-/// 3. Assign each OCR line to the nearest card (by X).
+/// 2. Full-frame raw OCR → text with word X positions.
+/// 3. Assign each OCR word to the nearest card (by X).
 /// 4. Per-card word set → prefix + fuzzy match against relic catalog.
 /// 5. Full-frame fallback if bar detection fails.
-#[cfg(target_os = "windows")]
+///
+/// `acc_col_words` (optional): accumulated words per column from previous
+/// attempts within the same reward-screen session.  When OCR is inconsistent
+/// across captures, a base name visible in Attempt 2 but missing in Attempt
+/// 13 can still help match the correct item.  The function both reads from
+/// and writes to this accumulator.
 pub fn extract_reward_items_twophase(
     pixels: &[u8], pix_w: u32, pix_h: u32, _game_h: u32,
     catalog: &[(String, String)],
     capture_info: &str,
     hint_squad_size: Option<usize>,
+    ui_scale: f32,
+    mut acc_col_words: Option<&mut std::collections::HashMap<usize, std::collections::HashSet<String>>>,
 ) -> (bool, bool, Vec<String>, Vec<f32>, String) {
 
     // ── 1. Raw OCR ────────────────────────────────────────────────────────────
-    let (raw_full, ocr_lines) =
-        match run_windows_ocr(to_bmp(pixels, pix_w, pix_h), pix_w, pix_h) {
+    // Full-frame OCR with thresholding.  We parse TSV at WORD level so that
+    // even when Tesseract merges text from adjacent cards into one "line",
+    // each word still carries its own X position and can be assigned to the
+    // correct card independently.
+    #[cfg(target_os = "windows")]
+    let (raw_full, ocr_words) =
+        match run_ocr(to_bmp(pixels, pix_w, pix_h), pix_w) {
             Ok(r) => r,
             Err(e) => return (false, false, vec![], vec![],
                 format!("├─ Capture  : {}\n└─ OCR error: {}", capture_info, e)),
         };
+    #[cfg(not(target_os = "windows"))]
+    let (raw_full, ocr_words) =
+        match run_ocr(pixels, pix_w, pix_h, _game_h, ui_scale) {
+            Ok(r) => r,
+            Err(e) => return (false, false, vec![], vec![],
+                format!("├─ Capture  : {}\n└─ OCR error: {}", capture_info, e)),
+        };
+    // Dark frames are where the whole-band pass garbles a 2nd/3rd card and the tight
+    // per-column re-OCR fallback earns its cost; gate that fallback on this so bright
+    // frames neither pay the extra Tesseract passes nor risk a re-OCR on a slightly
+    // off hardcoded column producing a wrong card.
+    let band_dark = avg_brightness(pixels) < 80;
     if raw_full.len() < 4 {
-        // Save the captured BMP — open in photo viewer to diagnose:
-        //   Black image  → PrintWindow didn't capture DX content (try borderless windowed mode)
-        //   Game content → OCR engine issue (COM/language)
-        let _ = std::fs::write(
-            std::env::temp_dir().join("frameforge_capture_debug.bmp"),
-            to_bmp(pixels, pix_w, pix_h),
-        );
+        let debug_bmp = std::env::temp_dir().join("frameforge_capture_debug.bmp");
+        let _ = std::fs::write(&debug_bmp, to_bmp(pixels, pix_w, pix_h));
         let avg = avg_brightness(pixels);
         let kind = if avg < 30 { "dark-frame" } else { "ocr-empty" };
         return (false, false, vec![], vec![], format!(
-            "├─ Capture  : {}\n└─ OCR      : returned no text ({}, avg={})\n   Saved: %TEMP%\\frameforge_capture_debug.bmp",
-            capture_info, kind, avg
+            "├─ Capture  : {}\n└─ OCR      : returned no text ({}, avg={})\n   Saved: {}",
+            capture_info, kind, avg, debug_bmp.display()
         ));
     }
 
@@ -1279,7 +1357,7 @@ pub fn extract_reward_items_twophase(
     // ── 2. Find card positions from rarity bars ───────────────────────────────
     // Rarity bars are always present regardless of Owned/Crafted labels.
     // If detection fails, fall back to X-gap grouping of OCR lines.
-    let (bar_result, bar_diag) = find_rarity_bars(pixels, pix_w, pix_h);
+    let (bar_result, bar_diag) = find_rarity_bars(pixels, pix_w, pix_h, ui_scale);
 
     let (card_centers, _bar_y): (Vec<f32>, f32) = match &bar_result {
         Some((centers, by)) => (centers.clone(), *by),
@@ -1296,7 +1374,6 @@ pub fn extract_reward_items_twophase(
     let raw_norm = normalise(&raw_full);
     let is_prime_like = |w: &str| -> bool {
         if w.starts_with("prim") && w.len() >= 4 { return true; }
-        if w == "pri" { return true; }  // OCR truncation: "Lavos Prime" → "Lavos Pri"
         if w.len() >= 3 && w.len() <= 7 { return lev_dist(w, "prime") <= 1; }
         false
     };
@@ -1316,13 +1393,9 @@ pub fn extract_reward_items_twophase(
     //   single-linkage: 0.50-0.41=0.09 < 0.10 (merged), 0.59-0.50=0.09 < 0.10 (merged) → 1 cluster
     //   centroid:       0.50-0.41=0.09 < 0.10 (extend, center→0.455), 0.59-0.455=0.135 > 0.10 → 2 clusters
     let ocr_cluster_count: usize = {
-        // Filter to lines that are (a) long enough to be item text and
-        // (b) NOT in the top 10% of the capture. The reward cards never appear
-        // there — only the game title bar and screen-edge HUD overlays (FPS
-        // counters, GPU widgets) do. Excluding them prevents spurious x-clusters.
-        let mut xs: Vec<f32> = ocr_lines.iter()
-            .filter(|(t, _, y)| t.trim().len() >= 3 && *y >= 0.10)
-            .map(|(_, x, _)| *x)
+        let mut xs: Vec<f32> = ocr_words.iter()
+            .filter(|(t, _)| t.trim().len() >= 3)
+            .map(|(_, x)| *x)
             .collect();
         xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         if xs.is_empty() { 0 }
@@ -1344,35 +1417,81 @@ pub fn extract_reward_items_twophase(
             count.min(4)
         }
     };
-    // EE hint (squad size from EE.log) is authoritative when OCR word-count undercounts.
-    // e.g. 4-player run where OCR only sees 3 "Prime" tokens → use 4 from hint so that
-    // hardcoded_card_centers(4) spreads columns wide enough to separate adjacent cards.
-    let word_card_count = (prime_count + forma_count)
+    // Distinct strong catalog matches across the whole frame.
+    // When OCR garbles "Prime" or merges adjacent columns, prime_count and the
+    // x-cluster count can undercount (a 4-player screen reading as 3 — which then
+    // drops a card entirely). Counting the distinct item BASE NAMES that score
+    // highly against the catalog recovers the true count: each physical card is
+    // one prime item, so N distinct strong matches ⇒ at least N cards. The 0.80
+    // threshold mirrors the full-frame fill path below, so this count never
+    // exceeds what that path can actually populate (avoids unreachable targets).
+    let match_card_count: usize = {
+        let all_words = build_word_set(
+            &raw_full.lines().map(|l| l.to_string()).collect::<Vec<_>>()
+        );
+        let mut bases: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (_unique, display_name) in catalog {
+            if display_name.len() < 5 { continue; }
+            if score_item(display_name, &all_words) >= 0.80 {
+                if let Some(first) = normalise(display_name).split_whitespace().next() {
+                    bases.insert(first.to_string());
+                }
+            }
+        }
+        bases.len()
+    };
+
+    // Two separate card counts, because the squad hint and the on-screen evidence
+    // each fail in opposite directions:
+    //
+    //   evidence_count — what we can SEE/READ on screen. Drives COMPLETENESS (when
+    //     we trust and lock the result). Can UNDER-count badly: OCR garbles
+    //     "Prime"/"Forma" tokens, two parts of one set share a base name, and text
+    //     X-clusters merge — a real 4-card screen can read as 2.
+    //
+    //   layout_count — how many COLUMNS to carve the band into. Includes the EE.log
+    //     squad size so genuine full squads get enough columns to physically
+    //     separate adjacent cards even when every evidence signal undercounts. The
+    //     squad size can OVER-count (a squadmate with no relic, or who left), but
+    //     two guards neutralise that: (1) the same-set dedup after matching removes
+    //     any phantom an over-wide layout splits out of one card, and (2)
+    //     COMPLETENESS is tied to evidence_count, so a stale hint never blocks
+    //     locking the real (smaller) count.
+    let evidence_count = (prime_count + forma_count)
         .max(ocr_cluster_count)
+        .max(match_card_count)
+        .clamp(1, 4);
+    let layout_count = evidence_count
         .max(hint_squad_size.unwrap_or(0))
         .clamp(1, 4);
+    // Column layout / fill target use the generous count.
+    let word_card_count = layout_count;
 
-    // ── 2c. Assign OCR lines to card columns ──────────────────────────────────
-    // Use bar centers only when:
-    //   • count matches prime+forma (guards against partial detection), AND
-    //   • centers pass the spacing sanity check (guards against false positives
-    //     from card artwork — orange/gold item renders trigger is_bar_pixel and
-    //     produce bunched centers like [0.37, 0.50, 0.62, 0.71] instead of the
-    //     expected even spread [0.24, 0.41, 0.59, 0.76]).
+    // ── 2c. Assign OCR words to card columns ──────────────────────────────────
+    // We parse TSV at WORD level.  Even when Tesseract merges adjacent cards
+    // into one "line", each word still has its own bounding-box X centre, so
+    // we can assign it to the correct card independently.
     let bars_trusted = !card_centers.is_empty()
         && card_centers.len() == word_card_count
-        && bar_centers_are_valid(&card_centers);
+        && bar_centers_are_valid(&card_centers, ui_scale);
     let active_centers: Vec<f32> = if bars_trusted {
+        // Bar centres come straight from the image, so they are already at the
+        // correct (scaled) positions — no UI-scale adjustment needed.
         card_centers.clone()
     } else {
+        // Hardcoded centres are measured at 100% UI; pull them toward screen
+        // centre proportionally for smaller UI scales (the reward box stays
+        // centred and scales linearly).
         hardcoded_card_centers(word_card_count)
+            .iter()
+            .map(|&c| 0.5 + (c - 0.5) * ui_scale)
+            .collect()
     };
 
     let columns: Vec<(Vec<String>, f32)> = {
         let mut cols: Vec<(Vec<String>, f32)> =
             active_centers.iter().map(|&cx| (Vec::new(), cx)).collect();
-        for (text, x, y) in &ocr_lines {
-            if *y < 0.10 { continue; } // exclude top-of-screen HUD overlays and the game's own title bar
+        for (word, x) in &ocr_words {
             let idx = active_centers.iter().enumerate()
                 .min_by(|(_, a), (_, b)| {
                     (x - *a).abs().partial_cmp(&(x - *b).abs())
@@ -1380,9 +1499,11 @@ pub fn extract_reward_items_twophase(
                 })
                 .map(|(i, _)| i)
                 .unwrap_or(0);
-            cols[idx].0.push(text.clone());
+            cols[idx].0.push(word.clone());
         }
-        cols
+        // Join words into a single text blob per column — build_word_set normalises
+        // and splits on whitespace anyway, so a joined string is fine.
+        cols.into_iter().map(|(words, cx)| (vec![words.join(" ")], cx)).collect()
     };
 
     // ── 3a. Per-card matching (only when rarity bars gave reliable columns) ─────
@@ -1391,6 +1512,9 @@ pub fn extract_reward_items_twophase(
     // columns produces wrong items. Only use per-column when bars were detected.
     let mut items: Vec<String> = Vec::new();
     let mut positions: Vec<f32> = Vec::new();
+    // Match confidence per accepted item — used by the same-set dedup below to keep
+    // the strongest copy when an over-wide layout produces a phantom sibling.
+    let mut item_scores: Vec<f32> = Vec::new();
 
     let (_bar_y_frac, have_bars) = match &bar_result {
         Some((_, by)) => (*by, true),
@@ -1399,9 +1523,36 @@ pub fn extract_reward_items_twophase(
 
     let mut col_match_log: Vec<String> = Vec::new();
 
+    // Per-column matching keeps each card's OCR text isolated, which is what
+    // disambiguates same-frame siblings: a card reading "...Systems Blueprint"
+    // matches ONLY "Xaku Prime Systems Blueprint", not its Chassis/Neuroptics
+    // siblings. (Pooling the whole frame's words — as the fill path does — makes
+    // every sibling score high off the shared "xaku/prime/blueprint" tokens and
+    // floods the result with one frame's parts.) The earlier dropped-card bug was
+    // purely a COUNT problem (3 columns instead of 4), now fixed by the
+    // match_card_count signal above — so per-column runs on the hardcoded-centre
+    // fallback too, just with the correct number of columns.
     for (col_idx, (col_texts, cx)) in columns.iter().enumerate() {
         if items.len() >= active_centers.len() { break; }
-        let words = build_word_set(col_texts);
+        let mut words = build_word_set(col_texts);
+
+        // Merge accumulated words from previous attempts in this session.
+        // OCR is often inconsistent: the base name may be clear in one capture
+        // and garbled in another.  Accumulating gives us the best of both.
+        let mut acc_used = false;
+        if let Some(ref acc) = acc_col_words {
+            if let Some(prev) = acc.get(&col_idx) {
+                for w in prev {
+                    if words.insert(w.clone()) { acc_used = true; }
+                }
+            }
+        }
+
+        // Save current words into the accumulator for future attempts.
+        if let Some(ref mut acc) = acc_col_words {
+            let entry = acc.entry(col_idx).or_default();
+            for w in &words { entry.insert(w.clone()); }
+        }
 
         // Log what OCR text this column contains
         let col_preview: Vec<&str> = col_texts.iter().take(4).map(|s| s.trim()).collect();
@@ -1479,15 +1630,45 @@ pub fn extract_reward_items_twophase(
             }
         }
 
+        // ── Tight per-column re-OCR fallback ─────────────────────────────────
+        // When the whole-band pass garbles a column (common on dark frames, where a
+        // 2nd card's name reads as noise because the brighter card dominates the
+        // single-pass threshold), re-OCR a tight crop around just this column with
+        // contrast preprocessing. The final 0.75 gate below still guards quality, so
+        // this can only rescue a failing column — passing columns never reach here.
+        // Gated to dark frames (the case it was built for) to avoid re-OCR cost and
+        // wrong-card risk on bright frames.
+        if best_score < 0.75 && band_dark {
+            let half_w = if columns.len() > 1 { 0.06 } else { 0.10 };
+            let rx0 = (cx - half_w).max(0.0);
+            let rx1 = (cx + half_w).min(1.0);
+            if let Ok(tight) = ocr_pixels_rect(pixels, pix_w, pix_h, rx0, rx1, 0.42, 0.70) {
+                let tight_words = build_word_set(std::slice::from_ref(&tight));
+                if !tight_words.is_empty() {
+                    for (unique_name, display_name) in catalog {
+                        if display_name.len() < 5 { continue; }
+                        let s = score_item(display_name, &tight_words);
+                        let wc = normalise(display_name).split_whitespace().count();
+                        if s > best_score || (s >= best_score - 1e-6 && wc > best_word_count) {
+                            best_score = s;
+                            best_word_count = wc;
+                            best_unique = Some(unique_name.clone());
+                        }
+                    }
+                }
+            }
+        }
+
         // Log the match result for this column
         let best_display = best_unique.as_ref()
             .and_then(|u| catalog.iter().find(|(k, _)| k == u))
             .map(|(_, n)| n.as_str())
             .unwrap_or("—");
         let col_preview: Vec<&str> = col_texts.iter().take(4).map(|s| s.trim()).collect();
+        let acc_label = if acc_used { " (+acc)" } else { "" };
         col_match_log.push(format!(
-            "  Col[{}] x={:.2}: score={:.2} → \"{}\"\n    OCR: {:?}",
-            col_idx, cx, best_score, best_display, col_preview
+            "  Col[{}] x={:.2}: score={:.2}{} → \"{}\"\n    OCR: {:?}",
+            col_idx, cx, best_score, acc_label, best_display, col_preview
         ));
 
         // Require 0.67 for per-column. Items where only "prime"+"blueprint" match
@@ -1512,32 +1693,32 @@ pub fn extract_reward_items_twophase(
         let unique = match best_unique { Some(u) => u, None => continue };
         // No dedup here — each column is a distinct physical card.
         // Two players cracking the same relic legitimately show the same reward twice.
-        // The `seen` set is only used in section 3b (full-frame fallback) where we
-        // don't have column separation.
+        // Same-set phantoms from an over-wide column layout are removed later by the
+        // base-word X-cluster dedup, which uses these scores to keep the strongest.
         items.push(unique);
         positions.push(*cx);
+        item_scores.push(best_score);
         let _ = col_idx;
     }
 
     // ── 3b. Full-frame fill ───────────────────────────────────────────────────
-    // Determine expected card count — take the max of all three signals so that
-    // any one reliable source prevents early lock-in:
-    //   • EE.log squad size  (ground truth when available)
-    //   • prime+forma count  (fuzzy word count from OCR)
+    // Expected card count from on-screen evidence only (see word_card_count above):
+    //   • word_card_count   (prime+forma / x-clusters / distinct strong matches)
     //   • rarity bar count   (visual, only when bars passed spacing validation)
+    // The EE.log squad size is deliberately NOT used here — it can exceed the real
+    // card count (player with no relic, or who left), which previously fabricated a
+    // phantom extra card.
     // IMPORTANT: only include bar count when bars_trusted. Rejected bars can give
     // wrong counts (e.g. 4 bars detected on a 3-card screen) that keep the OCR
     // loop retrying forever on a number it can never reach.
-    let estimated_cards = hint_squad_size
-        .unwrap_or(0)
-        .max(word_card_count)
+    let estimated_cards = word_card_count
         .max(if bars_trusted { card_centers.len() } else { 0 })
         .max(1);
 
     if items.len() < estimated_cards {
         let all_words = build_word_set(
-            &ocr_lines.iter()
-                .map(|(t, _, _)| t.clone())
+            &ocr_words.iter()
+                .map(|(t, _)| t.clone())
                 .collect::<Vec<_>>()
         );
 
@@ -1546,14 +1727,11 @@ pub fn extract_reward_items_twophase(
         // (for left-to-right ordering), but still used in scoring.
         const GENERIC: &[&str] = &["prime", "owned", "crafted", "blueprint"];
 
-        // Find candidates with score ≥ 0.80 and sort by their first OCR line index.
-        // OCR reads left-to-right, so line index approximates screen position.
-        // Example: "Dual Zoren Prime Blueprint" → key word "zoren" → OCR line 1
-        //          "Forma Blueprint"             → key word "forma"  → OCR line 4
-        //          "Venato Prime Handle"         → key word "venato" → OCR line 6
-        // Sorting by these indices gives the correct left→right overlay order
-        // without requiring accurate X positions from OCR bounding rects.
-        let mut candidates: Vec<(usize, f32, usize, String)> = Vec::new(); // (line_idx, score, name_len, unique)
+        // Find candidates with score ≥ 0.80 and sort by leftmost X position.
+        // OCR words carry individual bounding-box centres, so we find the leftmost
+        // word that matches a key word for each candidate.  This gives the correct
+        // left→right overlay order without relying on Tesseract's line grouping.
+        let mut candidates: Vec<(f32, f32, usize, String)> = Vec::new(); // (x_pos, score, name_len, unique)
         for (unique_name, display_name) in catalog {
             if display_name.len() < 5 { continue; }
             let s = score_item(display_name, &all_words);
@@ -1564,24 +1742,24 @@ pub fn extract_reward_items_twophase(
                 .filter(|w| w.len() >= 4 && !GENERIC.contains(w))
                 .collect();
 
-            // Find the earliest OCR line that contains one of this item's key words
-            let first_line = if key_words.is_empty() {
-                500usize // no unique identifier → sort after items with known positions
+            // Find the leftmost OCR word that contains one of this item's key words
+            let leftmost_x = if key_words.is_empty() {
+                0.999f32 // no unique identifier → sort after items with known positions
             } else {
-                ocr_lines.iter().enumerate()
-                    .find(|(_, (line_text, _, _))| {
-                        let lt = normalise(line_text);
-                        key_words.iter().any(|&w| lt.contains(w))
+                ocr_words.iter()
+                    .filter(|(word_text, _)| {
+                        let wt = normalise(word_text);
+                        key_words.iter().any(|&w| wt.contains(w))
                     })
-                    .map(|(i, _)| i)
-                    .unwrap_or(999) // not found in OCR → last priority
+                    .map(|(_, x)| *x)
+                    .fold(0.999f32, f32::min)
             };
 
-            candidates.push((first_line, s, display_name.len(), unique_name.clone()));
+            candidates.push((leftmost_x, s, display_name.len(), unique_name.clone()));
         }
-        // Primary: OCR line order (left → right). Secondary: score. Tertiary: name length.
+        // Primary: leftmost X (left → right). Secondary: score. Tertiary: name length.
         candidates.sort_by(|a, b|
-            a.0.cmp(&b.0)
+            a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
                 .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
                 .then(b.2.cmp(&a.2))
         );
@@ -1601,7 +1779,7 @@ pub fn extract_reward_items_twophase(
             }
         }
 
-        for (_, _, _, unique) in candidates {
+        for (_, s, _, unique) in candidates {
             if items.len() >= estimated_cards { break; }
             let dn = match catalog.iter().find(|(u, _)| *u == unique) {
                 Some((_, n)) => n.clone(),
@@ -1628,6 +1806,7 @@ pub fn extract_reward_items_twophase(
                 }
             }
             items.push(unique);
+            item_scores.push(s);
         }
 
         // Assign positions using the estimated card count for even spacing.
@@ -1641,6 +1820,46 @@ pub fn extract_reward_items_twophase(
         }
     }
 
+    // ── 3c. Same-set phantom dedup ─────────────────────────────────────────────
+    // A column layout wider than the real card count (squad hint > cards on screen
+    // — a squadmate with no relic, or who left) can split one card's text across
+    // two columns and match two DIFFERENT parts of the same set (e.g. Atlas Prime
+    // Blueprint + Atlas Prime Chassis Blueprint). Bound each base name to the number
+    // of distinct X positions its identifier word actually occupies on screen: one
+    // physical card → one X cluster. Two players holding different parts of the same
+    // set sit at well-separated X positions, so they survive. Highest score wins.
+    if items.len() > 1 && items.len() == item_scores.len() {
+        let base_of = |u: &str| -> String {
+            catalog.iter().find(|(k, _)| k == u)
+                .and_then(|(_, n)| normalise(n).split_whitespace().next().map(|s| s.to_string()))
+                .unwrap_or_default()
+        };
+        let mut by_base: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+        for (i, u) in items.iter().enumerate() {
+            by_base.entry(base_of(u)).or_default().push(i);
+        }
+        let mut drop = vec![false; items.len()];
+        for (base, idxs) in &by_base {
+            if base.is_empty() || idxs.len() <= 1 { continue; }
+            let allowed = base_word_x_clusters(base, &ocr_words).max(1);
+            if idxs.len() <= allowed { continue; }
+            let mut by_score = idxs.clone();
+            by_score.sort_by(|&a, &b| item_scores[b]
+                .partial_cmp(&item_scores[a]).unwrap_or(std::cmp::Ordering::Equal));
+            for &i in &by_score[allowed..] { drop[i] = true; }
+        }
+        if drop.iter().any(|&d| d) {
+            let (mut ni, mut np) = (Vec::new(), Vec::new());
+            for i in 0..items.len() {
+                if !drop[i] {
+                    ni.push(items[i].clone());
+                    np.push(*positions.get(i).unwrap_or(&0.5));
+                }
+            }
+            items = ni; positions = np;
+        }
+    }
+
     // ── Diagnostic string ─────────────────────────────────────────────────────
     let col_mode = if bars_trusted { "bar columns (validated)" }
                    else if have_bars { "hardcoded (bars rejected)" }
@@ -1648,14 +1867,25 @@ pub fn extract_reward_items_twophase(
     let ff_items: Vec<&str> = items.iter().map(|s| {
         catalog.iter().find(|(u,_)| u == s).map(|(_,n)| n.as_str()).unwrap_or(s.as_str())
     }).collect();
-    // is_complete = true means "found all cards expected for this squad size".
-    // lib.rs uses this to decide when to stop retrying OCR.
-    let is_complete = !items.is_empty() && items.len() >= estimated_cards;
-    let expected_src = match (hint_squad_size, !card_centers.is_empty()) {
-        (Some(h), _) if h >= word_card_count && h >= card_centers.len() => "EE.log",
-        (_, true) if card_centers.len() >= word_card_count => "bars",
-        _ if ocr_cluster_count > prime_count + forma_count => "x-clusters",
-        _ => "prime+forma",
+    // is_complete gates the double-confirmation lock in lib.rs. It is tied to the
+    // EVIDENCE count (not the layout/hint count): we lock once we've matched at
+    // least as many cards as the screen actually shows evidence for. Using the
+    // layout count here would demand the hint's (possibly inflated) number and
+    // block locking the correct, smaller deduped result.
+    let complete_target = evidence_count
+        .max(if bars_trusted { card_centers.len() } else { 0 })
+        .max(1);
+    let is_complete = !items.is_empty() && items.len() >= complete_target;
+    // Count source for diagnostics. The EE.log squad hint is shown on its own line
+    // below but is no longer a count source — the card count is evidence-driven.
+    let expected_src = if bars_trusted && card_centers.len() >= word_card_count {
+        "bars"
+    } else if match_card_count >= ocr_cluster_count && match_card_count >= prime_count + forma_count {
+        "matches"
+    } else if ocr_cluster_count > prime_count + forma_count {
+        "x-clusters"
+    } else {
+        "prime+forma"
     };
     let ee_hint_str = match hint_squad_size {
         Some(n) => format!("{} players (from EE.log)", n),
@@ -1665,18 +1895,18 @@ pub fn extract_reward_items_twophase(
         "├─ Capture  : {}\n\
          ├─ OCR      : {} chars, {} lines\n\
          ├─ Bars     : {}\n\
-         ├─ Prime/Forma: {}p + {}f + {}x = {} cards\n\
+         ├─ Prime/Forma: {}p + {}f + {}x + {}m = {} evidence ({} layout cols)\n\
          ├─ EE hint  : {}\n\
          ├─ Expected : {} cards (from {}){}\n\
          ├─ Match    : {} — {} formed\n\
          {}\n\
          └─ Items    : {:?}",
         capture_info,
-        raw_full.len(), ocr_lines.len(),
+        raw_full.len(), ocr_words.len(),
         bar_diag,
-        prime_count, forma_count, ocr_cluster_count, word_card_count,
+        prime_count, forma_count, ocr_cluster_count, match_card_count, evidence_count, word_card_count,
         ee_hint_str,
-        estimated_cards, expected_src,
+        complete_target, expected_src,
         if is_complete { " ✅ complete" } else { " ⚡ partial" },
         col_mode, columns.len(),
         col_match_log.join("\n"),
@@ -1689,17 +1919,781 @@ pub fn extract_reward_items_twophase(
 
 
 #[cfg(not(target_os = "windows"))]
-pub fn capture_warframe_reward_area() -> Option<(Vec<u8>, u32, u32, u32, String)> { None }
+pub fn capture_warframe_reward_area() -> Option<(Vec<u8>, u32, u32, u32, String)> {
+    let windows = xcap::Window::all().ok()?;
+    let warframe = windows.into_iter().find(|w| {
+        w.title().map(|t| t.to_lowercase().contains("warframe")).unwrap_or(false)
+    })?;
 
-#[cfg(not(target_os = "windows"))]
-pub fn run_windows_ocr(_bmp: Vec<u8>, _w: u32, _h: u32) -> Result<(String, Vec<(String, f32, f32)>), String> {
-    Err("Windows only".into())
+    let image = warframe.capture_image().ok()?;
+    let full_w = image.width();
+    let full_h = image.height();
+    if full_w < 100 || full_h < 100 { return None; }
+
+    // Capture ONLY the reward text band (centre of screen, y ≈ 30–55 %).
+    // The overlay window is placed at y ≈ 74 % so it is never in this band.
+    let cap_y = (full_h as f32 * 0.30) as u32;
+    let cap_h = (full_h as f32 * 0.25) as u32;
+    let cap_bot = (cap_y + cap_h).min(full_h);
+    let actual_cap_h = cap_bot - cap_y;
+
+    let mut pixels = Vec::with_capacity((full_w * actual_cap_h * 4) as usize);
+    for y in cap_y..cap_bot {
+        for x in 0..full_w {
+            let px = image.get_pixel(x, y);
+            pixels.push(px[2]); // B
+            pixels.push(px[1]); // G
+            pixels.push(px[0]); // R
+            pixels.push(px[3]); // A
+        }
+    }
+
+    let avg = avg_brightness(&pixels);
+    let info = format!(
+        "xcap  {}×{}px (band {}–{}px)  avg_brightness={}",
+        full_w, full_h, cap_y, cap_bot, avg
+    );
+    Some((pixels, full_w, actual_cap_h, full_h, info))
 }
 
+/// Parse Tesseract TSV at WORD level.
 #[cfg(not(target_os = "windows"))]
-pub fn extract_reward_items_twophase(
-    _pixels: &[u8], _w: u32, _cap_h: u32, _full_h: u32,
-    _catalog: &[(String, String)], _capture_info: &str, _hint_squad_size: Option<usize>,
-) -> (bool, bool, Vec<String>, Vec<f32>, String) {
-    (false, false, vec![], vec![], String::new())
+fn parse_tsv_words(tsv: &str, img_w: u32) -> Vec<(String, f32)> {
+    let mut words: Vec<(String, f32)> = Vec::new();
+    for row in tsv.lines().skip(1) {
+        let cols: Vec<&str> = row.split('\t').collect();
+        if cols.len() < 12 { continue; }
+        let level: i32 = cols[0].parse().unwrap_or(0);
+        if level != 5 && level != 4 { continue; }
+        let text = cols[11].to_string();
+        if text.trim().is_empty() { continue; }
+        let left: f32 = cols[6].parse().unwrap_or(0.0);
+        let width: f32 = cols[8].parse().unwrap_or(0.0);
+        let x_frac = if img_w > 0 { (left + width / 2.0) / img_w as f32 } else { 0.5 };
+        words.push((text, x_frac));
+    }
+    words
+}
+
+/// Encode RGB pixels as a 24-bit BGR BMP for Tesseract set_image_from_mem.
+#[cfg(not(target_os = "windows"))]
+fn rgb_to_bmp(pixels_rgb: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let row_bytes = width * 3;
+    let padding   = (4 - row_bytes % 4) % 4;
+    let row_stride = row_bytes + padding;
+    let image_size = row_stride * height;
+    let file_size  = 54 + image_size;
+
+    let mut bmp = Vec::with_capacity(file_size as usize);
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&file_size.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&54u32.to_le_bytes());
+    bmp.extend_from_slice(&40u32.to_le_bytes());
+    bmp.extend_from_slice(&(width as i32).to_le_bytes());
+    bmp.extend_from_slice(&(-(height as i32)).to_le_bytes());
+    bmp.extend_from_slice(&1u16.to_le_bytes());
+    bmp.extend_from_slice(&24u16.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&image_size.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+
+    for row in 0..height {
+        for col in 0..width {
+            let i = ((row * width + col) * 3) as usize;
+            // BMP is BGR, input is RGB
+            bmp.push(pixels_rgb[i + 2]); // B
+            bmp.push(pixels_rgb[i + 1]); // G
+            bmp.push(pixels_rgb[i]);     // R
+        }
+        for _ in 0..padding { bmp.push(0); }
+    }
+    bmp
+}
+
+/// Main entry point for Linux.
+///
+/// Strategy (learned from testing on real captures):
+///   1. Crop horizontally to the centred reward box (~968 px at 1080p).
+///      This removes the Warframe character visible on the sides.
+///   2. Crop vertically to the text band inside the reward box.
+///      This removes item icons above and rarity bars below.
+///   3. Convert to greyscale.  Tesseract's internal adaptive thresholding
+///      handles low-contrast grey text on dark cards far better than our
+///      crude theme-based binary thresholding, which was destroying text.
+///   4. OCR the whole band in ONE pass (PSM 6) so each item name stays intact.
+///      (The old per-strip split sliced cards straddling a strip boundary.)
+///   5. Map each word's position back to full-image fractions for the caller's
+///      column assignment — this function does NOT decide the card count.
+#[cfg(not(target_os = "windows"))]
+pub fn run_ocr(pixels: &[u8], pix_w: u32, pix_h: u32, full_h: u32, ui_scale: f32) -> Result<(String, Vec<(String, f32)>), String> {
+    let scale = full_h as f32 / 1080.0;
+
+    // ── 1. Horizontal crop to centred reward box ────────────────────────────
+    // wfinfo-ng constants: reward box is 968 px wide at 1080p, centred. The box
+    // (and the cards inside it) shrink linearly with the in-game UI scale, so we
+    // narrow the crop to match — keeping it centred means the 4 equal columns
+    // below land on the actual card positions at any UI scale.
+    let most_w = (968.0 * scale * ui_scale) as u32;
+    let x_off = if pix_w > most_w { (pix_w - most_w) / 2 } else { 0 };
+    let crop_w = most_w.min(pix_w);
+
+    // ── 2. Vertical crop to text band inside the reward box ─────────────────
+    // The captured band is 25 % of the full height (y ≈ 30–55 %).
+    //
+    // Empirically calibrated from real 1080p captures:
+    //   • Item text sits roughly at band y = 90–150 within a 270-px band.
+    //   • Player names appear below the cards at band y ≈ 180+.
+    //   • Shifting the crop UP by 40 px captures 3-line item names that extend
+    //     higher; the height excludes player names that used to leak into OCR.
+    //   • A 130-px crop gives the single-pass OCR enough context for 2–3 line
+    //     names. (The reward icon sits in the top of this band, but the single
+    //     full-frame OCR below tolerates it; a tighter "icon-free" crop was tried
+    //     and actually read 2-line names WORSE and clipped cards whose text sits
+    //     higher in the band, so the taller band wins.)
+    // The item text shrinks with UI scale, so the band offset and height scale too.
+    // A 60 px floor keeps enough rows for Tesseract at the smallest supported scale.
+    let text_y_start = (pix_h as f32 / 3.0 - 40.0 * ui_scale).max(0.0);  // shifted up ~40 px
+    let text_y_end   = (text_y_start + (130.0 * ui_scale).max(60.0)).min(pix_h as f32);
+
+    let crop_y = text_y_start as u32;
+    let crop_h = ((text_y_end - text_y_start).max(1.0) as u32).min(pix_h.saturating_sub(crop_y));
+
+    // ── 3. Convert cropped region to greyscale ──────────────────────────────
+    let mut grey = Vec::with_capacity((crop_w * crop_h) as usize);
+    for y in crop_y..(crop_y + crop_h) {
+        for x in x_off..(x_off + crop_w).min(pix_w) {
+            let i = ((y * pix_w + x) * 4) as usize;
+            let lum = if i + 2 < pixels.len() {
+                ((pixels[i+2] as u32 + pixels[i+1] as u32 + pixels[i] as u32) / 3) as u8
+            } else { 128 };
+            grey.push(lum);
+        }
+    }
+
+    // Debug: save cropped greyscale
+    let debug_grey = std::env::temp_dir().join("frameforge_ocr_debug_grey.bmp");
+    let grey_rgb: Vec<u8> = grey.iter().flat_map(|&l| [l, l, l]).collect();
+    let _ = std::fs::write(&debug_grey, rgb_to_bmp(&grey_rgb, crop_w, crop_h));
+
+    // ── 4. OCR the whole text band in ONE pass ──────────────────────────────
+    // A single wide image keeps every item name intact. The previous approach
+    // OCR'd 4 fixed-width strips, which SLICED any card straddling a strip
+    // boundary — e.g. "FORMA BLUEPRINT" became "Fo" in one strip + "rma
+    // Blueprint" in the next, so that card matched nothing and was lost. We still
+    // parse the TSV at WORD level, so every word keeps its own X position for the
+    // downstream column assignment; no card-count guess happens in this function.
+    //
+    // Trim a few px off each side to drop the card border dividers ("| name |"),
+    // which otherwise OCR as phantom "|" / "I" glyphs. Scales with resolution / UI.
+    let border_crop = (5.0 * scale * ui_scale).round() as u32;
+    let bx0 = border_crop.min(crop_w.saturating_sub(1));
+    let bx1 = crop_w.saturating_sub(border_crop).max(bx0 + 1);
+    let band_w = bx1 - bx0;
+    let mut band_grey = Vec::with_capacity((band_w * crop_h) as usize);
+    for y in 0..crop_h {
+        for x in bx0..bx1 {
+            band_grey.push(grey[(y * crop_w + x) as usize]);
+        }
+    }
+
+    // Dark-frame contrast stretch (adaptive — only when the band is genuinely dark,
+    // so bright captures behave identically). On dim tilesets the faint card text
+    // sits below Tesseract's adaptive threshold, so a 2nd/3rd card's words are
+    // dropped and its X-cluster vanishes. Stretching [median, p99.5] → [0,255]
+    // recovers those words so the card-count clustering sees both cards; the tight
+    // per-column re-OCR then reads each garbled name.
+    if !band_grey.is_empty() {
+        let mean: u32 = band_grey.iter().map(|&v| v as u32).sum::<u32>() / band_grey.len() as u32;
+        if mean < 80 {
+            let mut hist = [0u32; 256];
+            for &v in &band_grey { hist[v as usize] += 1; }
+            let total = band_grey.len() as u32;
+            let pct = |p: f32| -> u8 {
+                let target = (total as f32 * p) as u32;
+                let mut acc = 0u32;
+                for (v, &c) in hist.iter().enumerate() {
+                    acc += c;
+                    if acc >= target { return v as u8; }
+                }
+                255
+            };
+            let lo = pct(0.50) as f32;
+            let hi = (pct(0.995) as f32).max(lo + 1.0);
+            for v in band_grey.iter_mut() {
+                *v = (((*v as f32 - lo) * 255.0 / (hi - lo)).clamp(0.0, 255.0)) as u8;
+            }
+        }
+    }
+
+    let band_rgb: Vec<u8> = band_grey.iter().flat_map(|&l| [l, l, l]).collect();
+    let bmp = rgb_to_bmp(&band_rgb, band_w, crop_h);
+
+    // PSM 6 (assume a single uniform block of text) reads the card names
+    // left→right across the band. It beat the default (3), sparse (11/12) and
+    // column (4) modes on real captures — those dropped or merged whole cards.
+    let tess = tesseract::Tesseract::new(None, Some("eng"))
+        .map_err(|e| e.to_string())?
+        .set_variable("tessedit_pageseg_mode", "6")
+        .map_err(|e| e.to_string())?;
+    let mut tess = match tess.set_image_from_mem(&bmp) {
+        Ok(t) => t.recognize().map_err(|e| e.to_string())?,
+        Err(e) => return Err(e.to_string()),
+    };
+
+    let full_text = tess.get_text().unwrap_or_default();
+    let tsv = tess.get_tsv_text(0).unwrap_or_default();
+    let x0_frac    = (x_off + bx0) as f32 / pix_w as f32;
+    let scale_frac = band_w as f32 / pix_w as f32;
+    let all_words: Vec<(String, f32)> = parse_tsv_words(&tsv, band_w)
+        .into_iter()
+        .map(|(w, x)| (w, x0_frac + x * scale_frac))
+        .collect();
+
+    Ok((full_text, all_words))
+}
+
+// ─── Linux riven OCR primitives ──────────────────────────────────────────────
+// Mirror the Windows capture_warframe_pixels / ocr_pixels_rect[_raw] interface
+// so the cross-platform riven commands (ocr_riven_screen, riven_screen_status,
+// riven_screen_visible) work on Linux. Capture uses xcap; OCR uses Tesseract —
+// the same engine the relic reward pipeline already uses — in place of WinRT OCR.
+
+/// Capture the full Warframe client area as a BGRA buffer.
+/// The byte layout matches the Windows capture_warframe_pixels output so the
+/// shared preprocess_for_ocr and the rect-crop math below are identical across
+/// platforms.
+#[cfg(not(target_os = "windows"))]
+pub fn capture_warframe_pixels() -> Result<(Vec<u8>, u32, u32), String> {
+    let windows = xcap::Window::all().map_err(|e| format!("xcap: {e}"))?;
+    let warframe = windows
+        .into_iter()
+        .find(|w| w.title().map(|t| t.to_lowercase().contains("warframe")).unwrap_or(false))
+        .ok_or_else(|| "Warframe window not found".to_string())?;
+
+    let image = warframe.capture_image().map_err(|e| format!("capture: {e}"))?;
+    let full_w = image.width();
+    let full_h = image.height();
+    if full_w < 100 || full_h < 100 { return Err("Window too small".into()); }
+
+    let mut pixels = vec![0u8; (full_w * full_h * 4) as usize];
+    for y in 0..full_h {
+        for x in 0..full_w {
+            let px = image.get_pixel(x, y); // xcap returns RGBA
+            let i = ((y * full_w + x) * 4) as usize;
+            pixels[i]     = px[2]; // B
+            pixels[i + 1] = px[1]; // G
+            pixels[i + 2] = px[0]; // R
+            pixels[i + 3] = px[3]; // A
+        }
+    }
+    Ok((pixels, full_w, full_h))
+}
+
+/// Linux diagnostics capture. xcap grabs the Warframe window's own surface
+/// (XWayland composited), so any overlay drawn on top by the compositor is NOT
+/// guaranteed to be included — unlike the Windows desktop BitBlt path — but it
+/// still captures the game state for scanner/OCR debugging. Returns BGRA pixels.
+#[cfg(not(target_os = "windows"))]
+pub fn capture_screen_for_diagnostics() -> Result<(Vec<u8>, u32, u32), String> {
+    capture_warframe_pixels()
+}
+
+/// Crop a fractional BGRA rect and encode it as a 24-bit RGB BMP for Tesseract.
+/// When `preprocess` is set, the crop is grayscaled + contrast-stretched first
+/// (helps colored stat-element glyphs read as neutral text, as on Windows).
+#[cfg(not(target_os = "windows"))]
+fn bgra_rect_to_bmp(
+    pixels: &[u8], full_w: u32, full_h: u32,
+    x_start: f32, x_end: f32, y_start: f32, y_end: f32,
+    preprocess: bool,
+) -> Result<Vec<u8>, String> {
+    let col_s = (full_w as f32 * x_start.clamp(0.0, 1.0)) as usize;
+    let col_e = ((full_w as f32 * x_end.clamp(0.0, 1.0)) as usize).min(full_w as usize);
+    let row_s = (full_h as f32 * y_start.clamp(0.0, 1.0)) as usize;
+    let row_e = ((full_h as f32 * y_end.clamp(0.0, 1.0)) as usize).min(full_h as usize);
+    if col_e <= col_s || row_e <= row_s { return Err("Region too small".into()); }
+    let rect_w = (col_e - col_s) as u32;
+    let rect_h = (row_e - row_s) as u32;
+    if rect_w < 4 || rect_h < 4 { return Err("Region too small".into()); }
+
+    let src_stride = full_w as usize * 4;
+    let dst_stride = rect_w as usize * 4;
+    let mut cropped = vec![0u8; dst_stride * rect_h as usize];
+    for row in 0..rect_h as usize {
+        let src = (row_s + row) * src_stride + col_s * 4;
+        let dst = row * dst_stride;
+        cropped[dst..dst + dst_stride].copy_from_slice(&pixels[src..src + dst_stride]);
+    }
+
+    let bgra = if preprocess {
+        preprocess_for_ocr(&cropped, rect_w, rect_h).0
+    } else {
+        cropped
+    };
+
+    // BGRA → RGB for rgb_to_bmp.
+    let mut rgb = Vec::with_capacity((rect_w * rect_h * 3) as usize);
+    for px in bgra.chunks_exact(4) {
+        rgb.push(px[2]); // R
+        rgb.push(px[1]); // G
+        rgb.push(px[0]); // B
+    }
+    Ok(rgb_to_bmp(&rgb, rect_w, rect_h))
+}
+
+/// Run Tesseract over a BMP and return the recognized text (PSM 6, single block).
+#[cfg(not(target_os = "windows"))]
+fn run_tesseract_text(bmp: &[u8]) -> Result<String, String> {
+    let tess = tesseract::Tesseract::new(None, Some("eng"))
+        .map_err(|e| e.to_string())?
+        .set_variable("tessedit_pageseg_mode", "6")
+        .map_err(|e| e.to_string())?;
+    let mut tess = tess
+        .set_image_from_mem(bmp)
+        .map_err(|e| e.to_string())?
+        .recognize()
+        .map_err(|e| e.to_string())?;
+    Ok(tess.get_text().unwrap_or_default())
+}
+
+/// OCR a fractional rectangle from a pre-captured BGRA buffer (with preprocessing).
+#[cfg(not(target_os = "windows"))]
+pub fn ocr_pixels_rect(
+    pixels: &[u8], full_w: u32, full_h: u32,
+    x_start: f32, x_end: f32, y_start: f32, y_end: f32,
+) -> Result<String, String> {
+    let bmp = bgra_rect_to_bmp(pixels, full_w, full_h, x_start, x_end, y_start, y_end, true)?;
+    run_tesseract_text(&bmp)
+}
+
+/// OCR a fractional rectangle WITHOUT preprocessing — white-on-dark UI text
+/// (e.g. "INVENTORY", "FITS IN") reads fine raw.
+#[cfg(not(target_os = "windows"))]
+pub fn ocr_pixels_rect_raw(
+    pixels: &[u8], full_w: u32, full_h: u32,
+    x_start: f32, x_end: f32, y_start: f32, y_end: f32,
+) -> Result<String, String> {
+    let bmp = bgra_rect_to_bmp(pixels, full_w, full_h, x_start, x_end, y_start, y_end, false)?;
+    run_tesseract_text(&bmp)
+}
+
+#[cfg(test)]
+mod tests {
+    // 4-card reward screen: Gyre Prime Blueprint, Paris Prime Upper Limb,
+    // Xaku Prime Chassis Blueprint, Kompressa Prime Blueprint.
+    #[cfg(not(target_os = "windows"))]
+    const FIXTURE_4CARD: &str =
+        "/workspace/Warframe/rewards_gyrebp_parisupper_xakuchassis_kompressabp.png";
+    // 3-card reward screen: Fang Prime Handle, Atlas Prime Blueprint, Braton Prime Stock.
+    #[cfg(not(target_os = "windows"))]
+    const FIXTURE_3CARD: &str =
+        "/workspace/Warframe/rewards_fanghandle_atlasbp_bratonstock.png";
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn test_run_ocr_on_reward_screenshot() {
+        use image::GenericImageView;
+        let img = image::open(FIXTURE_4CARD).unwrap();
+        let (w, h) = img.dimensions();
+
+        // Convert to BGRA (same as xcap produces)
+        let mut pixels = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let px = img.get_pixel(x, y);
+                pixels.push(px[2]); // B
+                pixels.push(px[1]); // G
+                pixels.push(px[0]); // R
+                pixels.push(px[3]); // A
+            }
+        }
+
+        // Simulate capture_warframe_reward_area: crop to y=30%-55%
+        let cap_y = (h as f32 * 0.30) as u32;
+        let cap_h = (h as f32 * 0.25) as u32;
+        let mut band_pixels = Vec::with_capacity((w * cap_h * 4) as usize);
+        for y in cap_y..(cap_y + cap_h) {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                band_pixels.push(pixels[i]);
+                band_pixels.push(pixels[i+1]);
+                band_pixels.push(pixels[i+2]);
+                band_pixels.push(pixels[i+3]);
+            }
+        }
+
+        let (full_text, words) = super::run_ocr(&band_pixels, w, cap_h, h, 1.0).unwrap();
+
+        println!("OCR full_text:\n{}", full_text);
+        println!("OCR words: {:?}", words);
+
+        // The screenshot contains: Gyre Prime BP, Paris Prime Upper Limb,
+        // Xaku Prime Chassis BP, Kompressa Prime BP
+        let combined = full_text.to_lowercase();
+        assert!(
+            combined.contains("gyre") || combined.contains("prime"),
+            "Expected at least some prime item text, got: {}", combined
+        );
+
+        // Check that we got words from multiple cards (at least 3 cards should have some text)
+        let cards_with_text: usize = (0..4)
+            .filter(|&card| {
+                let cx = match card {
+                    0 => 0.31, 1 => 0.44, 2 => 0.56, _ => 0.69,
+                };
+                words.iter().any(|(_, x)| (x - cx).abs() < 0.12)
+            })
+            .count();
+        assert!(
+            cards_with_text >= 2,
+            "Expected words in at least 2 cards, found in {}. Words: {:?}",
+            cards_with_text, words
+        );
+    }
+
+    /// Regression for the dropped-4th-card bug: a 4-card screen with NO EE squad
+    /// hint must still resolve all four items. Previously the card count came out
+    /// as 3 (garbled "Prime" + merged x-clusters), so "Paris Prime Upper Limb"
+    /// was split across columns and lost. The distinct-match count signal fixes it.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn test_extract_four_cards_no_hint() {
+        use image::GenericImageView;
+        let img = image::open(FIXTURE_4CARD).unwrap();
+        let (w, h) = img.dimensions();
+
+        let cap_y = (h as f32 * 0.30) as u32;
+        let cap_h = (h as f32 * 0.25) as u32;
+        let mut band = Vec::with_capacity((w * cap_h * 4) as usize);
+        for y in cap_y..(cap_y + cap_h) {
+            for x in 0..w {
+                let px = img.get_pixel(x, y);
+                band.push(px[2]); band.push(px[1]); band.push(px[0]); band.push(px[3]);
+            }
+        }
+
+        // Catalog includes the four real rewards AND same-frame siblings
+        // (Xaku Systems/Neuroptics, Paris Lower Limb, Gyre/Kompressa parts).
+        // These siblings share base words with the real drops, so a matcher that
+        // pools the whole frame's text would wrongly surface several of them —
+        // this is the "all Xaku parts as rewards" regression. Per-column matching
+        // must pick exactly one item per card.
+        let catalog: Vec<(String, String)> = vec![
+            ("/Lotus/Types/Recipes/Warframes/GyrePrimeBlueprint".into(),    "Gyre Prime Blueprint".into()),
+            ("/Lotus/Types/Recipes/Warframes/GyrePrimeChassis".into(),      "Gyre Prime Chassis Blueprint".into()),
+            ("/Lotus/Types/Recipes/Warframes/GyrePrimeSystems".into(),      "Gyre Prime Systems Blueprint".into()),
+            ("/Lotus/Types/Recipes/Weapons/ParisPrimeUpperLimb".into(),     "Paris Prime Upper Limb".into()),
+            ("/Lotus/Types/Recipes/Weapons/ParisPrimeLowerLimb".into(),     "Paris Prime Lower Limb".into()),
+            ("/Lotus/Types/Recipes/Weapons/ParisPrimeGrip".into(),          "Paris Prime Grip".into()),
+            ("/Lotus/Types/Recipes/Warframes/XakuPrimeChassis".into(),      "Xaku Prime Chassis Blueprint".into()),
+            ("/Lotus/Types/Recipes/Warframes/XakuPrimeSystems".into(),      "Xaku Prime Systems Blueprint".into()),
+            ("/Lotus/Types/Recipes/Warframes/XakuPrimeNeuroptics".into(),   "Xaku Prime Neuroptics Blueprint".into()),
+            ("/Lotus/Types/Recipes/Warframes/XakuPrimeBlueprint".into(),    "Xaku Prime Blueprint".into()),
+            ("/Lotus/Types/Recipes/Weapons/KompressaPrimeBlueprint".into(), "Kompressa Prime Blueprint".into()),
+            ("/Lotus/Types/Recipes/Weapons/KompressaPrimeReceiver".into(),  "Kompressa Prime Receiver".into()),
+            ("/Lotus/Types/Recipes/Warframes/MagPrimeBlueprint".into(),     "Mag Prime Blueprint".into()),
+            ("/Lotus/Types/Recipes/Weapons/BurstonPrimeBarrel".into(),      "Burston Prime Barrel".into()),
+        ];
+
+        let (complete, _relic, items, positions, dbg) = super::extract_reward_items_twophase(
+            &band, w, cap_h, h, &catalog, "test", None, 1.0, None,
+        );
+        println!("{}", dbg);
+        println!("items={:?} positions={:?} complete={}", items, positions, complete);
+
+        let bases = ["gyre", "paris", "xaku", "kompressa"];
+        let found: Vec<&str> = bases.iter().copied().filter(|b| {
+            items.iter().any(|u| {
+                catalog.iter().find(|(k, _)| k == u)
+                    .map(|(_, n)| n.to_lowercase().contains(b)).unwrap_or(false)
+            })
+        }).collect();
+        assert_eq!(found.len(), 4,
+            "Expected all 4 distinct items, found {:?} (items={:?})", found, items);
+        // Exactly 4 cards — no sibling flooding (e.g. multiple Xaku parts).
+        assert_eq!(items.len(), 4,
+            "Expected exactly 4 reward cards, got {} (items={:?})", items.len(), items);
+        // Each detected item must belong to a distinct frame/weapon (distinct base
+        // name) — catches the "all Xaku parts" regression directly.
+        let mut bases_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for u in &items {
+            let dn = catalog.iter().find(|(k, _)| k == u).map(|(_, n)| n.clone()).unwrap_or_default();
+            let base = dn.split_whitespace().next().unwrap_or("").to_lowercase();
+            assert!(bases_seen.insert(base.clone()),
+                "duplicate base frame {:?} among items {:?}", base, items);
+        }
+        // Positions must be sorted left→right so the overlay places them correctly.
+        for win in positions.windows(2) {
+            assert!(win[0] <= win[1] + 1e-3,
+                "positions not left→right ordered: {:?}", positions);
+        }
+    }
+
+    /// Regression for the dropped-card / sliced-Forma bug on a real 4-player drop
+    /// (Yareli Prime Chassis, Braton Prime Blueprint, Braton Prime Stock, Forma
+    /// Blueprint ×2). Two failures combined: every OCR evidence signal undercounted
+    /// (two Braton parts share a base, "Prime"/"Forma" garbled), and the old
+    /// fixed 4-strip OCR sliced "FORMA BLUEPRINT" across a strip boundary so it
+    /// matched nothing. Now: the layout uses the squad hint (4 columns), the
+    /// single full-frame OCR keeps each name intact, and the two Braton parts stay
+    /// distinct.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn test_four_player_drop_with_forma() {
+        use image::GenericImageView;
+        let img = image::open("/workspace/Warframe/rewards_missed_4p.png").unwrap();
+        let (w, h) = img.dimensions();
+        let cap_y = (h as f32 * 0.30) as u32;
+        let cap_h = (h as f32 * 0.25) as u32;
+        let mut band = Vec::with_capacity((w * cap_h * 4) as usize);
+        for y in cap_y..(cap_y + cap_h) {
+            for x in 0..w {
+                let px = img.get_pixel(x, y);
+                band.push(px[2]); band.push(px[1]); band.push(px[0]); band.push(px[3]);
+            }
+        }
+        let catalog: Vec<(String, String)> = vec![
+            ("/a".into(),  "Yareli Prime Chassis Blueprint".into()),
+            ("/a2".into(), "Yareli Prime Systems Blueprint".into()),
+            ("/a3".into(), "Yareli Prime Neuroptics Blueprint".into()),
+            ("/a4".into(), "Yareli Prime Blueprint".into()),
+            ("/b".into(),  "Braton Prime Blueprint".into()),
+            ("/c".into(),  "Braton Prime Stock".into()),
+            ("/d".into(),  "Braton Prime Barrel".into()),
+            ("/e".into(),  "Braton Prime Receiver".into()),
+            ("/f".into(),  "Forma Blueprint".into()),
+            ("/g".into(),  "Mag Prime Blueprint".into()),
+            ("/h".into(),  "Burston Prime Barrel".into()),
+        ];
+        let (complete, _r, items, positions, dbg) = super::extract_reward_items_twophase(
+            &band, w, cap_h, h, &catalog, "test", Some(4), 1.0, None,
+        );
+        println!("{}", dbg);
+        println!("complete={} items={:?} positions={:?}", complete, items, positions);
+        let display = |u: &String| catalog.iter().find(|(k, _)| k == u)
+            .map(|(_, n)| n.to_lowercase()).unwrap_or_default();
+        let names: Vec<String> = items.iter().map(display).collect();
+
+        // All four cards detected (the old strip OCR dropped to 2–3).
+        assert_eq!(items.len(), 4,
+            "Expected all 4 cards on a 4-player drop, got {} ({:?})", items.len(), names);
+        // Forma must be present — it was the sliced/lost card.
+        assert!(names.iter().any(|n| n.contains("forma")),
+            "Forma Blueprint missing (was sliced by the per-strip OCR): {:?}", names);
+        // Both distinct Braton parts present — not collapsed into one or duplicated.
+        assert!(names.iter().any(|n| n.contains("braton") && n.contains("blueprint")),
+            "Braton Prime Blueprint missing: {:?}", names);
+        assert!(names.iter().any(|n| n.contains("braton") && n.contains("stock")),
+            "Braton Prime Stock missing: {:?}", names);
+        // A Yareli card is present (part may vary with OCR quality).
+        assert!(names.iter().any(|n| n.contains("yareli")),
+            "Yareli card missing: {:?}", names);
+        assert_eq!(positions.len(), items.len(), "positions/items length mismatch");
+    }
+
+    /// Regression for the phantom-4th-card bug: a 3-card screen with a STALE EE
+    /// squad hint of 4 (a squadmate left, or ran no relic) must still resolve
+    /// exactly 3 items — never a fabricated 4th. Previously `.max(hint_squad_size)`
+    /// forced a 4-column layout onto 3 cards; the centre Atlas card's text split
+    /// across two columns and matched a phantom sibling ("Atlas Prime Chassis
+    /// Blueprint" alongside the real "Atlas Prime Blueprint"). The card count is
+    /// now evidence-driven, so the hint can no longer inflate it.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn test_three_cards_stale_hint_no_phantom() {
+        use image::GenericImageView;
+        let img = image::open(FIXTURE_3CARD).unwrap();
+        let (w, h) = img.dimensions();
+
+        let cap_y = (h as f32 * 0.30) as u32;
+        let cap_h = (h as f32 * 0.25) as u32;
+        let mut band = Vec::with_capacity((w * cap_h * 4) as usize);
+        for y in cap_y..(cap_y + cap_h) {
+            for x in 0..w {
+                let px = img.get_pixel(x, y);
+                band.push(px[2]); band.push(px[1]); band.push(px[0]); band.push(px[3]);
+            }
+        }
+
+        // Catalog includes the three real rewards AND same-SET siblings of each —
+        // especially "Atlas Prime Chassis Blueprint", the exact phantom that the
+        // old over-count produced next to the real "Atlas Prime Blueprint".
+        let catalog: Vec<(String, String)> = vec![
+            ("/Lotus/Types/Recipes/Weapons/WeaponParts/PrimeFangHandle".into(), "Fang Prime Handle".into()),
+            ("/Lotus/Types/Recipes/Weapons/FangPrimeBlade".into(),              "Fang Prime Blade".into()),
+            ("/Lotus/Types/Recipes/Weapons/FangPrimeBlueprint".into(),          "Fang Prime Blueprint".into()),
+            ("/Lotus/Types/Recipes/Warframes/AtlasPrimeBlueprint".into(),       "Atlas Prime Blueprint".into()),
+            ("/Lotus/Types/Recipes/Warframes/AtlasPrimeChassis".into(),         "Atlas Prime Chassis Blueprint".into()),
+            ("/Lotus/Types/Recipes/Warframes/AtlasPrimeSystems".into(),         "Atlas Prime Systems Blueprint".into()),
+            ("/Lotus/Types/Recipes/Warframes/AtlasPrimeNeuroptics".into(),      "Atlas Prime Neuroptics Blueprint".into()),
+            ("/Lotus/Types/Recipes/Weapons/WeaponParts/BratonPrimeStock".into(),"Braton Prime Stock".into()),
+            ("/Lotus/Types/Recipes/Weapons/BratonPrimeBarrel".into(),           "Braton Prime Barrel".into()),
+            ("/Lotus/Types/Recipes/Weapons/BratonPrimeReceiver".into(),         "Braton Prime Receiver".into()),
+            ("/Lotus/Types/Recipes/Weapons/BratonPrimeBlueprint".into(),        "Braton Prime Blueprint".into()),
+            ("/Lotus/Types/Recipes/Warframes/MagPrimeBlueprint".into(),         "Mag Prime Blueprint".into()),
+            ("/Lotus/Types/Recipes/Weapons/BurstonPrimeBarrel".into(),          "Burston Prime Barrel".into()),
+        ];
+
+        // Stale squad hint of 4 — the failing condition.
+        let (_complete, _relic, items, positions, dbg) = super::extract_reward_items_twophase(
+            &band, w, cap_h, h, &catalog, "test", Some(4), 1.0, None,
+        );
+        println!("{}", dbg);
+        println!("items={:?} positions={:?}", items, positions);
+
+        let display = |u: &String| catalog.iter().find(|(k, _)| k == u)
+            .map(|(_, n)| n.to_lowercase()).unwrap_or_default();
+
+        // Core regression: exactly 3 cards, no fabricated 4th.
+        assert_eq!(items.len(), 3,
+            "Expected exactly 3 reward cards (stale hint=4 must not add a 4th), got {} (items={:?})",
+            items.len(), items.iter().map(display).collect::<Vec<_>>());
+
+        // The three real bases are present.
+        for base in ["fang", "atlas", "braton"] {
+            assert!(items.iter().any(|u| display(u).contains(base)),
+                "missing expected base {:?} in {:?}", base, items.iter().map(display).collect::<Vec<_>>());
+        }
+
+        // No duplicate base — directly catches "Atlas Blueprint + Atlas Chassis".
+        let mut bases_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for u in &items {
+            let base = display(u).split_whitespace().next().unwrap_or("").to_string();
+            assert!(bases_seen.insert(base.clone()),
+                "duplicate base {:?} among items {:?}", base, items.iter().map(display).collect::<Vec<_>>());
+        }
+
+        for win in positions.windows(2) {
+            assert!(win[0] <= win[1] + 1e-3,
+                "positions not left→right ordered: {:?}", positions);
+        }
+    }
+
+    // ── Riven scan-area sizing (Phase 3) ──────────────────────────────────────
+    // Single-card reroll screenshots; expected stats encoded in the filenames.
+    #[cfg(not(target_os = "windows"))]
+    const RIVEN_IMG_AKARIUS: &str =
+        "/workspace/Warframe/Akarius_Hexa-lexitox_+1.4_Punch_Through_+46.3%_Status_Chance_+39.5%_<toxinemoji>_Toxin_MR8.png";
+    #[cfg(not(target_os = "windows"))]
+    const RIVEN_IMG_AKLATO: &str =
+        "/workspace/Warframe/Aklato_Crita-toxilis_+188%_Critical_Chance_+98.3%_<toxinemoji>_Toxin_+87.2%_Zoom_MR8.png";
+
+    #[cfg(not(target_os = "windows"))]
+    fn load_bgra(path: &str) -> (Vec<u8>, u32, u32) {
+        use image::GenericImageView;
+        let img = image::open(path).unwrap();
+        let (w, h) = img.dimensions();
+        let mut px = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let p = img.get_pixel(x, y);
+                px.push(p[2]); px.push(p[1]); px.push(p[0]); px.push(p[3]);
+            }
+        }
+        (px, w, h)
+    }
+
+    /// Phase 3 regression: the tightened, centred riven crop (the ui_scale=1.0
+    /// case, x 0.40–0.60 / y 0.60–0.78) must cleanly OCR the weapon name and every
+    /// rolled stat for both reference rolls (expected values are in the filenames).
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn test_riven_crop_reads_stats() {
+        let (x0, x1, y0, y1) = (0.40f32, 0.60f32, 0.60f32, 0.78f32);
+        let cases: &[(&str, &[&str])] = &[
+            (RIVEN_IMG_AKARIUS, &["akarius", "punch through", "status chance", "toxin"]),
+            (RIVEN_IMG_AKLATO,  &["aklato", "critical chance", "toxin", "zoom"]),
+        ];
+        for (path, expected) in cases {
+            let (px, w, h) = load_bgra(path);
+            let text = super::ocr_pixels_rect(&px, w, h, x0, x1, y0, y1)
+                .unwrap_or_default()
+                .to_lowercase();
+            for needle in *expected {
+                assert!(text.contains(needle),
+                    "riven crop missing {:?} for {}\nOCR text:\n{}", needle, path, text);
+            }
+        }
+    }
+
+    /// Regression: a short catalog base name must NOT match as an interior/suffix
+    /// substring of a longer DIFFERENT OCR word. "gara" inside "akjagara" wrongly
+    /// matched "Gara Prime Blueprint" on an Akjagara Prime card.
+    #[test]
+    fn test_word_match_no_interior_substring() {
+        use std::collections::HashSet;
+        let mk = |ws: &[&str]| ws.iter().map(|s| s.to_string()).collect::<HashSet<String>>();
+
+        let akja = mk(&["akjagara", "prime", "barrel", "blueprint"]);
+        assert!(!super::word_found_in_set("gara", &akja),
+            "'gara' must not match inside 'akjagara'");
+        assert!(super::word_found_in_set("akjagara", &akja),
+            "'akjagara' should match itself");
+
+        // Merged-token prefix matching must still work (Sevagoth Prime → sevagotfirime).
+        let merged = mk(&["sevagotfirime"]);
+        assert!(super::word_found_in_set("sevagoth", &merged),
+            "merged-token prefix 'sevagoth' should still match 'sevagotfirime'");
+
+        // A real Gara card (OCR token 'gara') must still match.
+        let gara = mk(&["gara", "prime", "blueprint"]);
+        assert!(super::word_found_in_set("gara", &gara),
+            "'gara' should match an actual Gara card");
+
+        // End-to-end: on an Akjagara card, Akjagara must outscore Gara.
+        let s_akja = super::score_item("Akjagara Prime Barrel Blueprint", &akja);
+        let s_gara = super::score_item("Gara Prime Blueprint", &akja);
+        assert!(s_akja > s_gara,
+            "Akjagara card: expected Akjagara ({s_akja}) > Gara ({s_gara})");
+    }
+
+    /// Regression for the dropped-2nd-card bug on a DARK frame (Dual Zoren Prime
+    /// Blueprint + Yareli Prime Chassis Blueprint). The dim tileset left the 2nd
+    /// card's name faint, OCR garbled "Yareli"→"Vorelo", and the spurious bar
+    /// segments were discarded → only 1 card emitted. Dark-frame contrast stretch +
+    /// bar-segment salvage must recover both cards.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn test_dualzoren_yareli_two_cards() {
+        use image::GenericImageView;
+        let img = image::open("/workspace/Warframe/rewards_dualzoren_yarelichassis.png").unwrap();
+        let (w, h) = img.dimensions();
+        let cap_y = (h as f32 * 0.30) as u32;
+        let cap_h = (h as f32 * 0.25) as u32;
+        let mut band = Vec::with_capacity((w * cap_h * 4) as usize);
+        for y in cap_y..(cap_y + cap_h) {
+            for x in 0..w {
+                let px = img.get_pixel(x, y);
+                band.push(px[2]); band.push(px[1]); band.push(px[0]); band.push(px[3]);
+            }
+        }
+        let catalog: Vec<(String, String)> = vec![
+            ("/dz".into(),  "Dual Zoren Prime Blueprint".into()),
+            ("/dzb".into(), "Dual Zoren Prime Blade".into()),
+            ("/dzh".into(), "Dual Zoren Prime Handle".into()),
+            ("/yc".into(),  "Yareli Prime Chassis Blueprint".into()),
+            ("/ys".into(),  "Yareli Prime Systems Blueprint".into()),
+            ("/yn".into(),  "Yareli Prime Neuroptics Blueprint".into()),
+            ("/yb".into(),  "Yareli Prime Blueprint".into()),
+            ("/gara".into(),"Gara Prime Blueprint".into()),
+            ("/mag".into(), "Mag Prime Blueprint".into()),
+            ("/burst".into(),"Burston Prime Barrel".into()),
+        ];
+        let (complete, _r, items, positions, dbg) = super::extract_reward_items_twophase(
+            &band, w, cap_h, h, &catalog, "test", None, 1.0, None,
+        );
+        println!("{}", dbg);
+        println!("complete={} items={:?} positions={:?}", complete, items, positions);
+        let display = |u: &String| catalog.iter().find(|(k, _)| k == u)
+            .map(|(_, n)| n.to_lowercase()).unwrap_or_default();
+        let names: Vec<String> = items.iter().map(display).collect();
+        assert!(names.iter().any(|n| n.contains("dual zoren")),
+            "Dual Zoren card missing: {:?}", names);
+        assert!(names.iter().any(|n| n.contains("yareli")),
+            "Yareli card missing (the dropped 2nd card): {:?}", names);
+    }
 }
