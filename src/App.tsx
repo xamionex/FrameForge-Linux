@@ -50,11 +50,11 @@ async function ensureRivenWindow(wx: number, wy: number, wh: number): Promise<{ 
     return null;
   }
 }
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWindow, availableMonitors } from "@tauri-apps/api/window";
 
 import Foundry from "./Foundry";
-import MarketHelper from "./MarketHelper";
-import RelicHelper from "./RelicHelper";
+import MarketHelper, { MARKET_FILTERS_DEFAULT } from "./MarketHelper";
+import RelicHelper, { RELIC_FILTERS_DEFAULT } from "./RelicHelper";
 import RivenAnalyzer from "./RivenAnalyzer";
 import RivenOverlayWindow from "./RivenOverlayWindow";
 import TimerHelper, { FissureWatch } from "./TimerHelper";
@@ -124,6 +124,7 @@ interface InventoryUpdate {
   changes: QuantityChange[];
   warframe_running: boolean;
   scanned_at: number;
+  consumed_suits?: string[];
 }
 
 type Module = "inventory" | "foundry" | "market" | "relics" | "rivens" | "timers" | "statistics" | "completionist";
@@ -340,6 +341,8 @@ export default function App() {
   const [masteryRank, setMasteryRank] = useState<number | null>(null);
   const [masteryData, setMasteryData] = useState<Record<string, number>>({});
   const [wfConnected, setWfConnected] = useState(false);
+  const [memoryProbing, setMemoryProbing] = useState(false);
+  const [rawScanning, setRawScanning] = useState(false);
   const [companionApiEnabled, setCompanionApiEnabled] = useState(false);
   const [memoryScannerEnabled, setMemoryScannerEnabled] = useState(false);
   const [wfmLoggedIn, setWfmLoggedIn] = useState(false);
@@ -361,6 +364,22 @@ export default function App() {
   const [filterUnvaulted,setFilterUnvaulted]= useState(false);
   const [sortMode, setSortMode] = useState<"qty-desc" | "qty-asc" | "name-asc" | "name-desc" | "recent">("qty-desc");
   const [filterRank, setFilterRank] = useState<number | "unranked" | null>(null);
+
+  // ── Per-tab persisted filter state ────────────────────────────────────────
+  const [foundryFilters, setFoundryFilters] = useState({
+    search: "", activeCat: "Warframes",
+    filterPrime: false, filterVaulted: false, filterUnvaulted: false,
+    filterMastered: false, filterUnmastered: false,
+    filterOwned: false, filterUnowned: false, filterReady: false,
+  });
+  const [marketFilters, setMarketFilters] = useState(MARKET_FILTERS_DEFAULT);
+  const [relicFilters, setRelicFilters] = useState(RELIC_FILTERS_DEFAULT);
+  const [syndicateFilters, setSyndicateFilters] = useState({
+    activeGroup: "main" as "main" | "openworld" | "other",
+    activeTab: "Steel Meridian", missingOnly: false, search: "",
+  });
+  const [statsTab, setStatsTab] = useState<"trade" | "item">("trade");
+  const [reportsDateRange, setReportsDateRange] = useState<number | "all">(30);
   const [lastChanged, setLastChanged] = useState<Record<string, number>>({});
   const [monitoring, setMonitoring] = useState(false);
   const [warframeRunning, setWarframeRunning] = useState(false);
@@ -444,7 +463,8 @@ export default function App() {
     (async () => {
       const creds = await invoke<[string, string] | null>("wfm_load_credentials").catch(() => null);
       if (creds) {
-        invoke("wfm_set_jwt", { jwt: creds[1] }).catch(() => {}); // silent — failure just means re-login on tab open
+        const session = await invoke<[string, string] | null>("wfm_set_jwt", { jwt: creds[1] }).catch(() => null);
+        if (session) setWfmLoggedIn(true);
       }
     })();
     // Fire-and-forget: populates WFM_TOP_CACHE so the Statistics tab is instant
@@ -566,6 +586,13 @@ export default function App() {
       }
       setWarframeRunning(p.warframe_running);
       setLastScan(p.scanned_at);
+      if (p.consumed_suits && p.consumed_suits.length > 0) {
+        setSubsummedWarframes(prev => {
+          const next = new Set(prev);
+          for (const s of p.consumed_suits!) next.add(s);
+          return next;
+        });
+      }
       if (p.changes.length > 0) {
         setChangeLog(prev => [...p.changes, ...prev].slice(0, 200));
         setLastChanged(prev => {
@@ -871,19 +898,42 @@ export default function App() {
     if (modularPopout) {
       if (modularWinRef.current) return;
       const g = modularWinGeomRef.current;
-      const win = new WebviewWindow("modular-popout", {
+
+      // Only restore saved position if it lands on a currently connected monitor.
+      // Guards against secondary monitor being unplugged since last session.
+      const createWin = (usePos: boolean) => new WebviewWindow("modular-popout", {
         url: "index.html?modular",
         title: "FrameForge — Modular Window",
         width: g.w ?? modularWidth,
         height: g.h ?? 700,
-        ...(g.x !== undefined ? { x: g.x } : {}),
-        ...(g.y !== undefined ? { y: g.y } : {}),
+        ...(usePos && g.x !== undefined ? { x: g.x } : {}),
+        ...(usePos && g.y !== undefined ? { y: g.y } : {}),
         minWidth: 180,
         minHeight: 300,
         resizable: true,
         decorations: true,
         alwaysOnTop: false,
       });
+
+      let win: WebviewWindow;
+      if (g.x !== undefined && g.y !== undefined) {
+        availableMonitors().then(monitors => {
+          const onScreen = monitors.some(m => {
+            const mp = m.position; const ms = m.size;
+            return g.x! >= mp.x && g.x! < mp.x + ms.width &&
+                   g.y! >= mp.y && g.y! < mp.y + ms.height;
+          });
+          win = createWin(onScreen);
+          modularWinRef.current = win;
+          win.once("tauri://destroyed", () => { modularWinRef.current = null; setModularPopout(false); });
+        }).catch(() => {
+          win = createWin(false);
+          modularWinRef.current = win;
+          win.once("tauri://destroyed", () => { modularWinRef.current = null; setModularPopout(false); });
+        });
+        return;
+      }
+      win = createWin(false);
       modularWinRef.current = win;
       win.once("tauri://destroyed", () => {
         modularWinRef.current = null;
@@ -1153,12 +1203,17 @@ export default function App() {
   // ── Derived data ───────────────────────────────────────────────────────────
 
   const mergedQty = useMemo(() => {
-    // Merge scanner quantities with API quantities (API wins on conflict).
-    // The stability buffer (2 consecutive scans) in the Rust scanner already
-    // filters out transient reads from mission reward screens, so we do not
-    // need to strip /Types/Recipes/ paths here.
-    return { ...quantities, ...apiQuantities };
-  }, [quantities, apiQuantities]);
+    // When API is disabled, use memory scanner quantities only — stale localStorage
+    // API data must not override live scanned values.
+    // When API is enabled, API data wins on conflict (authoritative for mods/arcanes).
+    const base = !companionApiEnabled ? quantities : { ...quantities, ...apiQuantities };
+    // Subsumed warframes are consumed by Helminth — force quantity 0 regardless of
+    // stale API or scanner data that may still report them as owned.
+    if (subsummedWarframes.size === 0) return base;
+    const result = { ...base };
+    for (const path of subsummedWarframes) result[path] = 0;
+    return result;
+  }, [quantities, apiQuantities, companionApiEnabled, subsummedWarframes]);
 
   const modCopiesMap = useMemo(() => {
     const map: Record<string, ModCopy[]> = {};
@@ -1269,18 +1324,16 @@ export default function App() {
         <div className="header-right">
           {/* ── Connection status chips ── */}
           {(() => {
-            // Scanner chip
+            // Memory chip
             const scanState: "online"|"warn"|"offline"|"disabled" =
               !memoryScannerEnabled ? "disabled"
-              : !monitoring         ? "offline"
               : warframeRunning     ? "online"
-              : "warn";
+              : "offline";
             const scanDetail =
               !memoryScannerEnabled ? "OFF"
               : !monitoring         ? "Idle"
-              : warframeRunning && lastScan ? timeStr(lastScan)
-              : warframeRunning     ? "Active"
-              : "No game";
+              : warframeRunning     ? "Scanning"
+              : "No Game";
 
             // WF API chip
             const wfApiState: "online"|"warn"|"offline"|"disabled" =
@@ -1317,11 +1370,11 @@ export default function App() {
               <>
                 <span
                   className={`conn-chip conn-${scanState}`}
-                  title={!memoryScannerEnabled ? "Memory Scanner disabled — enable in Settings" : warframeRunning ? `Last scan: ${lastScan ? new Date(lastScan * 1000).toLocaleTimeString() : "—"}` : "Warframe not detected"}
+                  title={!memoryScannerEnabled ? "Memory scanner disabled — enable in Settings" : warframeRunning ? "Warframe detected — scanning memory" : "Warframe not detected"}
                   onClick={!memoryScannerEnabled ? () => setShowSettings(true) : undefined}
                 >
                   <span className="conn-dot" />
-                  <span className="conn-label">Scanner</span>
+                  <span className="conn-label">Memory</span>
                   <span className="conn-detail">{scanDetail}</span>
                 </span>
                 <span
@@ -1663,6 +1716,45 @@ export default function App() {
                     </div>
                   ))}
                 </div>
+                <div className="settings-row" style={{ marginTop: 10 }}>
+                  <div className="settings-row-info">
+                    <span className="settings-row-label">Raw Memory Probe</span>
+                    <span className="settings-row-desc">Dumps inventory-related strings from Warframe's memory to memory_probe.txt in the data folder. Run after a mission to see the exact JSON format.</span>
+                  </div>
+                  <button className="btn-secondary" disabled={memoryProbing} onClick={() => {
+                    setMemoryProbing(true);
+                    invoke<string>("dump_memory_probe")
+                      .then(result => {
+                        const lines = result.split("\n").filter(l => l.trim());
+                        alert(`Probe complete — ${lines.length} entries written to:\n%LOCALAPPDATA%\\warframe-companion\\memory_probe.txt`);
+                      })
+                      .catch(e => alert("Probe failed: " + String(e)))
+                      .finally(() => setMemoryProbing(false));
+                  }}>{memoryProbing ? "Running…" : "Probe Memory"}</button>
+                </div>
+
+                <div className="settings-row" style={{ marginTop: 10 }}>
+                  <div className="settings-row-info">
+                    <span className="settings-row-label">Raw Memory Scan</span>
+                    <span className="settings-row-desc">
+                      {rawScanning
+                        ? "Recording all readable strings from Warframe's memory every 5 s → raw_scan.txt. Navigate menus in-game, then click Stop."
+                        : "Full raw memory scan — no filtering. Every readable string from every region is written to raw_scan.txt. Click Record, navigate the game, click Stop."}
+                    </span>
+                  </div>
+                  <button
+                    className={rawScanning ? "btn-danger" : "btn-secondary"}
+                    onClick={() => {
+                      invoke<string>("toggle_raw_scan")
+                        .then(status => {
+                          const active = status === "started";
+                          setRawScanning(active);
+                          if (!active) alert("Raw scan stopped.\nFile saved to:\n%LOCALAPPDATA%\\warframe-companion\\raw_scan.txt");
+                        })
+                        .catch(e => alert("Error: " + String(e)));
+                    }}
+                  >{rawScanning ? "⏹ Stop Recording" : "⏺ Record"}</button>
+                </div>
               </div>
 
               {/* ── Modular Window ── */}
@@ -1987,19 +2079,19 @@ export default function App() {
         {/* ── Foundry module ── */}
         {activeModule === "foundry" && (
           <ErrorBoundary>
-            <Foundry quantities={mergedQty} masteryData={masteryData} refreshKey={itemsRefreshKey} crafting={crafting} colorblindMode={colorblindMode} subsummedWarframes={subsummedWarframes} archonShards={archonShards} tracked={tracked} onTrackToggle={toggleTracked} />
+            <Foundry quantities={mergedQty} masteryData={masteryData} refreshKey={itemsRefreshKey} crafting={crafting} colorblindMode={colorblindMode} subsummedWarframes={subsummedWarframes} archonShards={archonShards} tracked={tracked} onTrackToggle={toggleTracked} filters={foundryFilters} onFiltersChange={setFoundryFilters} />
           </ErrorBoundary>
         )}
 
         {/* ── Market Helper module ── */}
         {activeModule === "market" && (
-          <MarketHelper quantities={mergedQty} apiQuantities={apiQuantities} refreshKey={itemsRefreshKey} crafting={crafting} onWfmLoginChange={setWfmLoggedIn} />
+          <MarketHelper quantities={mergedQty} apiQuantities={apiQuantities} refreshKey={itemsRefreshKey} crafting={crafting} onWfmLoginChange={setWfmLoggedIn} filters={marketFilters} onFiltersChange={setMarketFilters} />
         )}
 
         {/* ── Relics module ── */}
         {activeModule === "relics" && (
           <ErrorBoundary>
-            <RelicHelper quantities={mergedQty} apiQuantities={apiQuantities} masteryData={masteryData} refreshKey={itemsRefreshKey} colorblindMode={colorblindMode} />
+            <RelicHelper quantities={mergedQty} apiQuantities={apiQuantities} masteryData={masteryData} refreshKey={itemsRefreshKey} colorblindMode={colorblindMode} filters={relicFilters} onFiltersChange={setRelicFilters} />
           </ErrorBoundary>
         )}
 
@@ -2031,7 +2123,7 @@ export default function App() {
         {/* ── Statistics module ── */}
         {activeModule === "statistics" && (
           <ErrorBoundary>
-            <Statistics />
+            <Statistics tab={statsTab} onTabChange={setStatsTab} dateRange={reportsDateRange} onDateRangeChange={setReportsDateRange} />
           </ErrorBoundary>
         )}
 
@@ -2039,7 +2131,7 @@ export default function App() {
         {activeModule === "completionist" && (
           <ErrorBoundary>
             <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minHeight: 0 }}>
-              <Syndicates quantities={mergedQty} />
+              <Syndicates quantities={mergedQty} filters={syndicateFilters} onFiltersChange={setSyndicateFilters} />
             </div>
           </ErrorBoundary>
         )}

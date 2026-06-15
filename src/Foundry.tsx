@@ -29,6 +29,19 @@ interface CraftingJob {
 
 interface ArchonShard { type: string; tauforged: boolean; color: string; boost?: string; }
 
+export interface FoundryFilters {
+  search: string; activeCat: string;
+  filterPrime: boolean; filterVaulted: boolean; filterUnvaulted: boolean;
+  filterMastered: boolean; filterUnmastered: boolean;
+  filterOwned: boolean; filterUnowned: boolean; filterReady: boolean;
+}
+export const FOUNDRY_FILTERS_DEFAULT: FoundryFilters = {
+  search: "", activeCat: "Warframes",
+  filterPrime: false, filterVaulted: false, filterUnvaulted: false,
+  filterMastered: false, filterUnmastered: false,
+  filterOwned: false, filterUnowned: false, filterReady: false,
+};
+
 interface Props {
   quantities: Record<string, number>;
   masteryData: Record<string, number>;
@@ -39,6 +52,8 @@ interface Props {
   archonShards?: Record<string, ArchonShard[]>;
   tracked: string[];
   onTrackToggle: (id: string) => void;
+  filters: FoundryFilters;
+  onFiltersChange: (f: FoundryFilters) => void;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -410,24 +425,16 @@ const CRAFT_CATEGORIES = [
   "Companions", "Archwing", "Blueprints", "Misc",
 ];
 
-export default function Foundry({ quantities, masteryData, refreshKey, crafting, subsummedWarframes = new Set(), archonShards = {}, tracked, onTrackToggle }: Props) {
+export default function Foundry({ quantities, masteryData, refreshKey, crafting, subsummedWarframes = new Set(), archonShards = {}, tracked, onTrackToggle, filters, onFiltersChange }: Props) {
   const [craftable, setCraftable] = useState<CatalogItem[]>([]);
-  const [search, setSearch]       = useState("");
-  const [activeCat, setActiveCat] = useState("Warframes");
   const [recipes, setRecipes]     = useState<Map<string, RecipeComponent[]>>(new Map());
   const [relicDrops, setRelicDrops] = useState<Record<string, string[]>>({});
   const [relicNames, setRelicNames] = useState<Record<string, string>>({});
   const [modalItem, setModalItem] = useState<CatalogItem | null>(null);
 
-  // Mix-and-match filters
-  const [filterPrime,      setFilterPrime]      = useState(false);
-  const [filterVaulted,    setFilterVaulted]     = useState(false);
-  const [filterUnvaulted,  setFilterUnvaulted]   = useState(false);
-  const [filterMastered,   setFilterMastered]    = useState(false);
-  const [filterUnmastered, setFilterUnmastered]  = useState(false);
-  const [filterOwned,      setFilterOwned]       = useState(false);
-  const [filterUnowned,    setFilterUnowned]     = useState(false);
-  const [filterReady,      setFilterReady]       = useState(false);
+  const { search, activeCat, filterPrime, filterVaulted, filterUnvaulted, filterMastered, filterUnmastered, filterOwned, filterUnowned, filterReady } = filters;
+  const set = <K extends keyof FoundryFilters>(k: K, v: FoundryFilters[K]) => onFiltersChange({ ...filters, [k]: v });
+  const isFiltered = search !== "" || filterPrime || filterVaulted || filterUnvaulted || filterMastered || filterUnmastered || filterOwned || filterUnowned || filterReady;
 
   useEffect(() => {
     invoke<CatalogItem[]>("get_craftable_items").then(setCraftable).catch(() => setCraftable([]));
@@ -539,11 +546,14 @@ export default function Foundry({ quantities, masteryData, refreshKey, crafting,
       <div className="foundry-sidebar">
         <div className="foundry-search-wrap">
           <input className="foundry-search" placeholder="Search…" value={search}
-            onChange={e => { setSearch(e.target.value); if (e.target.value) setActiveCat("All" as any); }} />
+            onChange={e => {
+              const v = e.target.value;
+              onFiltersChange({ ...filters, search: v, ...(v ? { activeCat: "All" as any } : {}) });
+            }} />
         </div>
         {CRAFT_CATEGORIES.map(cat => (
           <button key={cat} className={`cat-btn ${activeCat === cat ? "cat-active" : ""}`}
-            onClick={() => { setActiveCat(cat); setSearch(""); }}>
+            onClick={() => onFiltersChange({ ...filters, activeCat: cat, search: "" })}>
             <span className="cat-label">{cat}</span>
             {categoryCounts[cat] ? (
               <span className="cat-count"><span className="cat-total">{categoryCounts[cat]}</span></span>
@@ -555,16 +565,17 @@ export default function Foundry({ quantities, masteryData, refreshKey, crafting,
       {/* ── Col 2: Card grid ── */}
       <div className="foundry-main">
         <div className="filter-bar">
-          <button className={`fchip ${filterPrime     ? "fchip-on" : ""}`} onClick={() => setFilterPrime(v => !v)}>Prime</button>
-          <button className={`fchip ${filterVaulted   ? "fchip-on" : ""}`} onClick={() => setFilterVaulted(v => !v)}>🔒 Vaulted</button>
-          <button className={`fchip ${filterUnvaulted ? "fchip-on" : ""}`} onClick={() => setFilterUnvaulted(v => !v)}>🔓 Unvaulted</button>
+          <button className={`fchip ${filterPrime     ? "fchip-on" : ""}`} onClick={() => set("filterPrime", !filterPrime)}>Prime</button>
+          <button className={`fchip ${filterVaulted   ? "fchip-on" : ""}`} onClick={() => set("filterVaulted", !filterVaulted)}>🔒 Vaulted</button>
+          <button className={`fchip ${filterUnvaulted ? "fchip-on" : ""}`} onClick={() => set("filterUnvaulted", !filterUnvaulted)}>🔓 Unvaulted</button>
           <span className="fbar-sep"/>
-          <button className={`fchip ${filterOwned     ? "fchip-on" : ""}`} onClick={() => setFilterOwned(v => !v)}>✓ Owned</button>
-          <button className={`fchip ${filterUnowned   ? "fchip-on" : ""}`} onClick={() => setFilterUnowned(v => !v)}>✕ Unowned</button>
-          <button className={`fchip ${filterReady     ? "fchip-on" : ""}`} onClick={() => setFilterReady(v => !v)}>⚡ Ready</button>
+          <button className={`fchip ${filterOwned     ? "fchip-on" : ""}`} onClick={() => set("filterOwned", !filterOwned)}>✓ Owned</button>
+          <button className={`fchip ${filterUnowned   ? "fchip-on" : ""}`} onClick={() => set("filterUnowned", !filterUnowned)}>✕ Unowned</button>
+          <button className={`fchip ${filterReady     ? "fchip-on" : ""}`} onClick={() => set("filterReady", !filterReady)}>⚡ Ready</button>
           <span className="fbar-sep"/>
-          <button className={`fchip ${filterMastered  ? "fchip-on" : ""}`} onClick={() => setFilterMastered(v => !v)}>★ Mastered</button>
-          <button className={`fchip ${filterUnmastered? "fchip-on" : ""}`} onClick={() => setFilterUnmastered(v => !v)}>☆ Unmastered</button>
+          <button className={`fchip ${filterMastered  ? "fchip-on" : ""}`} onClick={() => set("filterMastered", !filterMastered)}>★ Mastered</button>
+          <button className={`fchip ${filterUnmastered? "fchip-on" : ""}`} onClick={() => set("filterUnmastered", !filterUnmastered)}>☆ Unmastered</button>
+          {isFiltered && <button className="fchip fchip-reset" onClick={() => onFiltersChange({ ...FOUNDRY_FILTERS_DEFAULT, activeCat })}>Show All</button>}
           <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--muted)" }}>{visible.length} items</span>
           <HelpTip items={[
             { swatch: "rgba(240,192,64,.5)", icon: "✓✓", label: "Owned",          desc: "Gold border + ✓✓ — item built and in inventory" },

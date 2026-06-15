@@ -29,6 +29,14 @@ pub struct ScanResult {
     pub log_lines: Vec<String>,
     /// 4 item paths when the relic reward screen is active, None otherwise.
     pub relic_rewards: Option<Vec<String>>,
+    /// Address to pass as start_addr on the next call.
+    /// 0 means the scan completed naturally — restart from the beginning.
+    pub resume_addr: usize,
+    /// Chunk base addresses where the inventory root ("MiscItems":[{) was found.
+    /// Pass these back as hint_addrs on the next call for near-instant re-scan.
+    pub hot_addrs: Vec<usize>,
+    /// Warframe unique-name paths found in InfestedFoundry.ConsumedSuits (Helminth subsumed).
+    pub consumed_suits: Vec<String>,
 }
 
 // ─── Shared helpers ───────────────────────────────────────────────────────────
@@ -64,64 +72,178 @@ fn digits_end(data: &[u8], start: usize) -> usize {
 
 // ─── Scanner 1: Resources ─────────────────────────────────────────────────────
 //
-// Finds stackable items (resources, relics, blueprints) via:
-//   "ItemCount":N,"ItemType":"/Lotus/<path>"
+// Real MiscItems inventory entries are always {"ItemCount":N,"ItemType":"/Lotus/..."}
+// — the two fields are strictly adjacent with only a comma between them.
 //
-// Skips unique-item paths (warframes/weapons) — those have no ItemCount in the
-// real inventory JSON and are handled by scanner 2.
-// Takes the maximum quantity seen across all regions.
+// Reward/trade records use [{"ItemType":"...","ItemCount":N}] — ItemType first,
+// wrapped in brackets. Requiring strict adjacency eliminates cross-matches where
+// an ItemCount from one JSON object accidentally pairs with an ItemType from a
+// different nearby object (which caused Fieldron to flip between 1 and 3).
 
 fn scan_inventory_resources(data: &[u8], unique_paths: &std::collections::HashSet<String>) -> Vec<(String, i64)> {
-    let count_key  = b"\"ItemCount\":";
-    let type_infix = b",\"ItemType\":\"/Lotus/";
+    let count_key = b"\"ItemCount\":";
+    let type_key  = b"\"ItemType\":\"";
 
     let mut results: HashMap<String, i64> = HashMap::new();
-    let mut start = 0usize;
+    let mut pos = 0usize;
 
     loop {
-        let next = match data[start..].iter().position(|&b| b == b'"') {
-            Some(p) => start + p,
+        let count_rel = match data[pos..].windows(count_key.len()).position(|w| w == count_key) {
+            Some(p) => p,
             None => break,
         };
-        if next + count_key.len() > data.len() { break; }
-        if data[next..next + count_key.len()] != *count_key {
-            start = next + 1; continue;
-        }
-        let i = next;
+        let count_pos = pos + count_rel;
+        let num_start = count_pos + count_key.len();
 
-        let num_start = i + count_key.len();
+        // First byte after "ItemCount": must be an ASCII digit.
+        // Binary game structures also use this key but with non-ASCII integer bytes.
+        if num_start >= data.len() || !data[num_start].is_ascii_digit() {
+            pos = count_pos + 1;
+            continue;
+        }
+
         let qty = match parse_int(data, num_start) {
             Some(n) if n > 0 => n,
-            _ => { start = i + count_key.len(); continue; }
+            _ => { pos = count_pos + 1; continue; }
         };
+
+        // Require strict adjacency: digits must be immediately followed by ,"ItemType":"
+        // with nothing in between — no brackets, no other fields.
         let num_end = digits_end(data, num_start);
-
-        if num_end + type_infix.len() > data.len()
-            || data[num_end..num_end + type_infix.len()] != *type_infix
+        if num_end >= data.len() || data[num_end] != b',' {
+            pos = count_pos + 1;
+            continue;
+        }
+        let after_comma = num_end + 1;
+        if data.len() < after_comma + type_key.len()
+            || &data[after_comma..after_comma + type_key.len()] != type_key
         {
-            start = i + count_key.len(); continue;
+            pos = count_pos + 1;
+            continue;
+        }
+        let type_start = after_comma + type_key.len();
+
+        let path_end = match data[type_start..].iter().take(512).position(|&b| b == b'"') {
+            Some(e) => type_start + e,
+            None => { pos = count_pos + 1; continue; }
+        };
+
+        let path = match valid_lotus_path(&data[type_start..path_end]) {
+            Some(p) => p,
+            None => { pos = count_pos + 1; continue; }
+        };
+
+        if unique_paths.contains(&path) { pos = count_pos + 1; continue; }
+        if path.starts_with("/Lotus/Upgrades/") { pos = count_pos + 1; continue; }
+
+        let cap: i64 = if path.starts_with("/Lotus/Types/Recipes/") { 9_999 } else { 1_000_000 };
+        if qty <= cap {
+            // Keep the FIRST occurrence (lowest address). The real inventory JSON is always
+            // at lower addresses than any injected companion-tool data, so first-wins is correct.
+            results.entry(path).or_insert(qty);
         }
 
-        // type_infix ends with "/Lotus/" — path starts at the leading '/'
-        let path_start = num_end + type_infix.len() - 7;
-        if path_start >= data.len() { start = i + count_key.len(); continue; }
-        let rest = &data[path_start..];
-        if let Some(close) = rest.iter().position(|&b| b == b'"') {
-            if let Some(path) = valid_lotus_path(&rest[..close]) {
-                // Skip actual unique owned items (warframes/weapons/companions with ItemId)
-                // but NOT their blueprints — blueprints have ItemCount and should be tracked.
-                // We skip only paths that are in the unique scanner's exact path set.
-                if unique_paths.contains(&path) || path.starts_with("/Lotus/Upgrades/") {
-                    start = i + count_key.len(); continue;
-                }
-                let cap: i64 = if path.starts_with("/Lotus/Types/Recipes/") { 9_999 } else { 1_000_000 };
-                if qty <= cap {
-                    let e = results.entry(path).or_insert(qty);
-                    if qty > *e { *e = qty; }
-                }
+        pos = path_end + 1;
+    }
+
+    results.into_iter().collect()
+}
+
+// ─── Scanner 1b: Mods / Arcanes ──────────────────────────────────────────────
+//
+// RawUpgrades entries in memory have the format:
+//   {"ItemCount":N,"LastAdded":{"$oid":"..."},"ItemType":"/Lotus/Upgrades/..."}
+// ItemCount comes BEFORE ItemType with a nested LastAdded object in between —
+// strict-adjacency matching fails here. Instead, find ItemType then walk
+// backwards with brace-depth tracking to locate ItemCount in the same object.
+// Entries with a single copy omit ItemCount entirely (implicit qty = 1).
+
+fn scan_inventory_mods(data: &[u8]) -> Vec<(String, i64)> {
+    const RAW_KEY:   &[u8] = b"\"RawUpgrades\":[";
+    const TYPE_KEY:  &[u8] = b"\"ItemType\":\"";
+    const COUNT_KEY: &[u8] = b"\"ItemCount\":";
+    const MOD_PFX:   &[u8] = b"/Lotus/Upgrades/";
+
+    let mut results: HashMap<String, i64> = HashMap::new();
+    let mut outer = 0usize;
+
+    'outer: loop {
+        let rel = match data[outer..].windows(RAW_KEY.len()).position(|w| w == RAW_KEY) {
+            Some(p) => p,
+            None => break,
+        };
+        let section_start = outer + rel + RAW_KEY.len();
+        outer = section_start;
+
+        // 2 MB cap — accounts with thousands of mods need more room than 256 KB
+        let section_end = (section_start + 2 * 1024 * 1024).min(data.len());
+        let section = &data[section_start..section_end];
+
+        let mut pos = 0usize;
+        loop {
+            let type_rel = match section[pos..].windows(TYPE_KEY.len()).position(|w| w == TYPE_KEY) {
+                Some(p) => p,
+                None => continue 'outer,
+            };
+            let path_start = pos + type_rel + TYPE_KEY.len();
+
+            if section.len() < path_start + MOD_PFX.len()
+                || &section[path_start..path_start + MOD_PFX.len()] != MOD_PFX
+            {
+                pos = pos + type_rel + 1;
+                continue;
             }
+
+            let path_end = match section[path_start..].iter().take(512).position(|&b| b == b'"') {
+                Some(e) => path_start + e,
+                None => continue 'outer,
+            };
+
+            let path = match valid_lotus_path(&section[path_start..path_end]) {
+                Some(p) => p,
+                None => { pos = pos + type_rel + 1; continue; }
+            };
+
+            // Walk backwards from "ItemType" to find "ItemCount": in this object.
+            // Track brace depth so we stop at the '{' that opens the current entry.
+            let qty = {
+                let search_end = pos + type_rel;
+                let search_start_pos = search_end.saturating_sub(512);
+                let before = &section[search_start_pos..search_end];
+                let mut qty_val = 1i64;
+                let mut depth: i32 = 0;
+                let mut idx = before.len();
+                while idx > 0 {
+                    idx -= 1;
+                    match before[idx] {
+                        b'}' => depth += 1,
+                        b'{' => {
+                            if depth == 0 {
+                                // Reached opening '{' of this entry — no explicit ItemCount
+                                break;
+                            }
+                            depth -= 1;
+                        }
+                        _ => {}
+                    }
+                    if depth == 0
+                        && idx + COUNT_KEY.len() <= before.len()
+                        && &before[idx..idx + COUNT_KEY.len()] == COUNT_KEY
+                    {
+                        let num_start = search_start_pos + idx + COUNT_KEY.len();
+                        if num_start < section.len() && section[num_start].is_ascii_digit() {
+                            qty_val = parse_int(section, num_start).unwrap_or(1).max(1);
+                        }
+                        break;
+                    }
+                }
+                qty_val
+            };
+
+            // Accumulate — same path can appear multiple times (different rank copies)
+            *results.entry(path).or_insert(0) += qty;
+            pos = path_end + 1;
         }
-        start = i + count_key.len();
     }
 
     results.into_iter().collect()
@@ -269,6 +391,37 @@ fn scan_pending_recipes(data: &[u8]) -> Vec<PendingRecipe> {
     results
 }
 
+// ─── Scanner: Consumed suits (Helminth subsumed warframes) ───────────────────
+//
+// "ConsumedSuits" lives in the InfestedFoundry object of the same inventory
+// JSON blob as MiscItems.  Each entry is either a bare path string or an object
+// with an "ItemType" field — we extract all /Lotus/ paths we find between the
+// opening "[" and closing "]" of the array.
+
+fn scan_consumed_suits(data: &[u8]) -> Vec<String> {
+    const KEY: &[u8] = b"\"ConsumedSuits\":[";
+    let Some(key_pos) = data.windows(KEY.len()).position(|w| w == KEY) else { return vec![] };
+    let start = key_pos + KEY.len();
+    // Scan forward up to 8 KB for the closing bracket (handles large subsumption lists)
+    let window = &data[start..data.len().min(start + 8192)];
+    let end = window.iter().position(|&b| b == b']').unwrap_or(window.len());
+    let window = &window[..end];
+
+    let lotus: &[u8] = b"\"/Lotus/";
+    let mut results = Vec::new();
+    let mut pos = 0;
+    while pos + lotus.len() < window.len() {
+        let Some(found) = window[pos..].windows(lotus.len()).position(|w| w == lotus) else { break };
+        let path_start = pos + found + 1; // skip opening "
+        let Some(close) = window[path_start..].iter().position(|&b| b == b'"') else { break };
+        if let Ok(s) = std::str::from_utf8(&window[path_start..path_start + close]) {
+            results.push(s.to_string());
+        }
+        pos = path_start + close + 1;
+    }
+    results
+}
+
 // ─── Auth credentials scan ───────────────────────────────────────────────────
 //
 // When Warframe is running and logged in, the game stores the session credentials
@@ -400,10 +553,22 @@ fn scan_mastery_rank(data: &[u8]) -> Option<u32> {
     None
 }
 
+fn has_number_long_in(data: &[u8]) -> bool {
+    const LONG_KEY: &[u8] = b"$numberLong\"";
+    data.windows(LONG_KEY.len()).any(|w| w == LONG_KEY)
+}
+
 // ─── Main scan entry point ────────────────────────────────────────────────────
 
 #[cfg(target_os = "windows")]
-pub fn scan_warframe_memory(unique_names: &[String], display_names: &[String], assembled_names: &[String]) -> ScanResult {
+pub fn scan_warframe_memory(
+    unique_names: &[String],
+    display_names: &[String],
+    assembled_names: &[String],
+    start_addr: usize,   // 0 = start from beginning; non-zero = resume from this address
+    max_secs: u64,       // stop scanning after this many seconds and return resume_addr
+    hint_addrs: &[usize], // previously discovered hot chunk addresses — scanned first
+) -> ScanResult {
     use std::ffi::c_void;
     use std::mem;
     use windows_sys::Win32::{
@@ -419,7 +584,7 @@ pub fn scan_warframe_memory(unique_names: &[String], display_names: &[String], a
         return ScanResult {
             warframe_running: false, items_found: vec![], pending_recipes: vec![], mastery_rank: None, mastery_data: HashMap::new(), regions_scanned: 0,
             error: Some("No item paths loaded. Click 'Refresh item list' first.".to_string()),
-            log_lines: vec![], relic_rewards: None,
+            log_lines: vec![], relic_rewards: None, resume_addr: 0, hot_addrs: vec![], consumed_suits: vec![],
         };
     }
 
@@ -467,7 +632,7 @@ pub fn scan_warframe_memory(unique_names: &[String], display_names: &[String], a
             Err(e) => return ScanResult {
                 warframe_running: false, items_found: vec![], pending_recipes: vec![], mastery_rank: None, mastery_data: HashMap::new(), regions_scanned: 0,
                 error: Some(format!("AC build error: {}", e)),
-                log_lines: vec![], relic_rewards: None,
+                log_lines: vec![], relic_rewards: None, resume_addr: 0, hot_addrs: vec![], consumed_suits: vec![],
             },
         }
     };
@@ -477,7 +642,8 @@ pub fn scan_warframe_memory(unique_names: &[String], display_names: &[String], a
         None => return ScanResult {
             warframe_running: false, items_found: vec![], pending_recipes: vec![], mastery_rank: None, mastery_data: HashMap::new(), regions_scanned: 0,
             error: Some("Warframe is not running. Launch the game first.".to_string()),
-            log_lines: vec![], relic_rewards: None,
+            log_lines: vec!["[pid] find_warframe_pid returned None — process not found via ToolHelp snapshot".to_string()],
+            relic_rewards: None, resume_addr: 0, hot_addrs: vec![], consumed_suits: vec![],
         },
     };
 
@@ -487,28 +653,93 @@ pub fn scan_warframe_memory(unique_names: &[String], display_names: &[String], a
     let mut pending_recipes: Vec<PendingRecipe>            = Vec::new();
     let mut mastery_rank:    Option<u32>                   = None;
     let mut regions_scanned = 0usize;
-    let mut log_lines: Vec<String> = Vec::new();
+    let mut log_lines: Vec<String> = vec![
+        format!("[pid] found Warframe pid={}", pid),
+        format!("[setup] unique_paths={} assembled={}", unique_item_paths.len(), assembled_names.len()),
+    ];
+    // Per-scan probe counter — log context for the first 5 regions that contain "ItemCount":
+    let mut res_probe_count = 0usize;
+    // Chunk addresses where the inventory root was found — returned so the caller
+    // can pass them back as hint_addrs next call for a near-instant re-scan.
+    let mut hot_addrs_out: Vec<usize> = Vec::new();
+    let mut consumed_suits_out: Vec<String> = Vec::new();
+    // Declared outside unsafe so it's readable in the ScanResult at the end.
+    let mut resume_addr_out: usize = 0;
 
     unsafe {
         let process = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, 0, pid);
         if process == 0 {
+            let err_code = windows_sys::Win32::Foundation::GetLastError();
             return ScanResult {
                 warframe_running: true, items_found: vec![], pending_recipes: vec![], mastery_rank: None, mastery_data: HashMap::new(), regions_scanned: 0,
-                error: Some("Cannot open Warframe process. Run as Administrator.".to_string()),
-                log_lines: vec![], relic_rewards: None,
+                error: Some(format!("Cannot open Warframe process (error {}). Run as Administrator.", err_code)),
+                log_lines: vec![format!("[pid] OpenProcess failed for pid={} error={}", pid, err_code)],
+                relic_rewards: None, resume_addr: 0, hot_addrs: vec![], consumed_suits: vec![],
             };
         }
 
-        let mut address: usize = 0x10000;
+        let mut address: usize = if start_addr >= 0x10000 { start_addr } else { 0x10000 };
         let mbi_size = mem::size_of::<MEMORY_BASIC_INFORMATION>();
         let start_time = std::time::Instant::now();
-        let mut total_read: usize = 0;
 
-        loop {
-            if start_time.elapsed().as_secs() > 90 || total_read > 2_000_000_000 { break; }
+        // ── Fast path: re-scan previously discovered hot addresses first ──────
+        // Skips the rolling VirtualQueryEx walk for the most common case (steady-
+        // state: inventory JSON sits at the same heap address between game sessions).
+        const CHUNK_SIZE_HINT: usize = 8 * 1024 * 1024;
+        const MISC_KEY: &[u8] = b"\"MiscItems\":[{";
+        for &hint_base in hint_addrs {
+            // Skip hints in the EXE/DLL image range — these are false positives.
+            if hint_base >= 0x0004_0000_0000_0000 { continue; }
+            let mut mbi: MEMORY_BASIC_INFORMATION = mem::zeroed();
+            if VirtualQueryEx(process, hint_base as *const c_void, &mut mbi, mbi_size) == 0 { continue; }
+            if mbi.State != MEM_COMMIT { continue; }
+            let p = mbi.Protect;
+            if p & PAGE_NOACCESS != 0 || p & PAGE_GUARD != 0 { continue; }
+            let region_end = mbi.BaseAddress as usize + mbi.RegionSize;
+            if hint_base >= region_end { continue; }
+            let read_size = CHUNK_SIZE_HINT.min(region_end - hint_base);
+            let mut buf = vec![0u8; read_size];
+            let mut bytes_read = 0usize;
+            let ok = ReadProcessMemory(process, hint_base as *const c_void,
+                buf.as_mut_ptr() as *mut c_void, read_size, &mut bytes_read);
+            if ok == 0 || bytes_read < 16 { continue; }
+            let data = &buf[..bytes_read];
+            if !data.windows(MISC_KEY.len()).any(|w| w == MISC_KEY) { continue; }
+            // Still valid — run resource and mod scanners on it
+            hot_addrs_out.push(hint_base);
+            regions_scanned += 1;
+            let res_pairs = scan_inventory_resources(data, &unique_path_set);
+            if !res_pairs.is_empty() {
+                log_lines.push(format!("  [hint-resources] count={} addr=0x{:x}", res_pairs.len(), hint_base));
+                for (path, qty) in res_pairs { resources.entry(path).or_insert(qty); }
+            }
+            let mod_pairs = scan_inventory_mods(data);
+            if !mod_pairs.is_empty() {
+                log_lines.push(format!("  [hint-mods] count={}", mod_pairs.len()));
+                for (path, qty) in mod_pairs { resources.entry(path).or_insert(qty); }
+            }
+            if mastery_rank.is_none() { mastery_rank = scan_mastery_rank(data); }
+            if has_number_long_in(data) {
+                for h in scan_pending_recipes(data) { pending_recipes.push(h); }
+            }
+            let suits = scan_consumed_suits(data);
+            if !suits.is_empty() {
+                log_lines.push(format!("  [hint-consumed-suits] count={}", suits.len()));
+                for s in suits { if !consumed_suits_out.contains(&s) { consumed_suits_out.push(s); } }
+            }
+        }
+
+        'region: loop {
+            if start_time.elapsed().as_secs() >= max_secs {
+                resume_addr_out = address;
+                break;
+            }
 
             let mut mbi: MEMORY_BASIC_INFORMATION = mem::zeroed();
-            if VirtualQueryEx(process, address as *const c_void, &mut mbi, mbi_size) == 0 { break; }
+            if VirtualQueryEx(process, address as *const c_void, &mut mbi, mbi_size) == 0 {
+                resume_addr_out = 0;
+                break;
+            }
 
             let region_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
             if region_end <= address { break; }
@@ -517,78 +748,129 @@ pub fn scan_warframe_memory(unique_names: &[String], display_names: &[String], a
             if mbi.State != MEM_COMMIT { continue; }
             let p = mbi.Protect;
             if p & PAGE_NOACCESS != 0 || p & PAGE_GUARD != 0 { continue; }
+            // Skip pure execute pages (code sections) — same filter as raw_scan_pass.
             if p == 0x10 || p == 0x20 { continue; }
-            if mbi.RegionSize < 4096 || mbi.RegionSize > 128 * 1024 * 1024 { continue; }
+            if mbi.RegionSize < 4096 { continue; }
+            // No upper size limit — raw_scan_pass has none, and inventory has been
+            // confirmed in regions that dump_inventory_regions (256 MB cap) misses.
 
-            let mut buffer = vec![0u8; mbi.RegionSize];
+            const CHUNK_SIZE: usize = 8 * 1024 * 1024; // == CHUNK_SIZE_HINT above
+            const OVERLAP:    usize = 65_536;
+            let region_chunks = (mbi.RegionSize + CHUNK_SIZE - 1) / CHUNK_SIZE;
+            for chunk_idx in 0..region_chunks {
+            if start_time.elapsed().as_secs() >= max_secs {
+                resume_addr_out = mbi.BaseAddress as usize + chunk_idx * CHUNK_SIZE;
+                break 'region;
+            }
+            let chunk_off  = chunk_idx * CHUNK_SIZE;
+            let chunk_base = mbi.BaseAddress as usize + chunk_off;
+            let remaining  = mbi.RegionSize - chunk_off;
+            let read_size  = (CHUNK_SIZE + if chunk_idx + 1 < region_chunks { OVERLAP } else { 0 }).min(remaining);
+
+            let mut buffer = vec![0u8; read_size];
             let mut bytes_read: usize = 0;
             let ok = ReadProcessMemory(
-                process, mbi.BaseAddress as *const c_void,
-                buffer.as_mut_ptr() as *mut c_void, mbi.RegionSize, &mut bytes_read,
+                process, chunk_base as *const c_void,
+                buffer.as_mut_ptr() as *mut c_void, read_size, &mut bytes_read,
             );
             if ok == 0 || bytes_read <= 4 { continue; }
 
             let data = &buffer[..bytes_read];
             regions_scanned += 1;
-            total_read += bytes_read;
-            let base = mbi.BaseAddress as usize;
+
+            const COUNT_KEY:    &[u8] = b"\"ItemCount\":";
+            const LOTUS_KEY:    &[u8] = b"\"ItemType\":\"/Lotus/";
+            const LONG_KEY:     &[u8] = b"$numberLong\"";
+            const CONSUMED_KEY: &[u8] = b"\"ConsumedSuits\":[";
+            let has_item_count    = data.windows(COUNT_KEY.len()).any(|w| w == COUNT_KEY);
+            let has_lotus_type    = data.windows(LOTUS_KEY.len()).any(|w| w == LOTUS_KEY);
+            let has_number_long   = data.windows(LONG_KEY.len()).any(|w| w == LONG_KEY);
+            let has_misc_root     = data.windows(MISC_KEY.len()).any(|w| w == MISC_KEY);
+            let has_consumed_key  = data.windows(CONSUMED_KEY.len()).any(|w| w == CONSUMED_KEY);
+            if !has_item_count && !has_lotus_type && !has_number_long && !has_consumed_key { continue; }
+
+            if has_misc_root {
+                // Only record heap addresses as hot_addrs — skip EXE/DLL image range
+                // (Windows maps executables above ~0x7FF0_0000_0000; game heap is below ~4 TB).
+                // This prevents a false-positive match inside the game's read-only data section
+                // from displacing the real inventory heap address.
+                const MAX_HEAP_ADDR: usize = 0x0004_0000_0000_0000;
+                if chunk_base < MAX_HEAP_ADDR && !hot_addrs_out.contains(&chunk_base) {
+                    hot_addrs_out.push(chunk_base);
+                }
+                log_lines.push(format!("  [inv-root] found MiscItems array at 0x{:x}{}", chunk_base,
+                    if chunk_base >= MAX_HEAP_ADDR { " [EXE/DLL range — skipped as hint]" } else { "" }));
+            }
+            // Scan for ConsumedSuits in any chunk that contains the key — it may live
+            // in a different 8 MB chunk than MiscItems in large inventory blobs.
+            if has_consumed_key && consumed_suits_out.is_empty() {
+                let suits = scan_consumed_suits(data);
+                if !suits.is_empty() {
+                    log_lines.push(format!("  [consumed-suits] count={}", suits.len()));
+                    for s in suits { if !consumed_suits_out.contains(&s) { consumed_suits_out.push(s); } }
+                }
+            }
 
             // ── Scanner 1: Resources ──────────────────────────────────────────
-            // Quick marker check before the full scan: only process regions that
-            // actually contain inventory JSON. Veteran players can have inventories
-            // several MB in size (thousands of mods, relics, resources); the old
-            // 512 KB cap silently missed those larger blobs entirely.
-            // Unrelated large regions (code, graphics, audio) won't contain
-            // "ItemCount": and are skipped cheaply by this check.
-            let has_inventory = data.windows(13).any(|w| w == b"\"ItemCount\":");
-            if has_inventory {
+            if has_item_count || has_lotus_type {
                 let res_pairs = scan_inventory_resources(data, &unique_path_set);
                 if !res_pairs.is_empty() {
                     let preview: String = res_pairs.iter().take(5)
                         .map(|(p, q)| format!("{}={}", p.split('/').last().unwrap_or("?"), q))
                         .collect::<Vec<_>>().join(", ");
                     log_lines.push(format!(
-                        "  [resources] 0x{:010x} count={:>4}  {}{}",
-                        base, res_pairs.len(), preview,
-                        if res_pairs.len() > 5 { format!(" …+{}", res_pairs.len()-5) } else { String::new() }
+                        "  [resources] count={}  {}{}",
+                        res_pairs.len(), preview,
+                        if res_pairs.len() > 5 { format!(" +{} more", res_pairs.len()-5) } else { String::new() }
                     ));
                     for (path, qty) in res_pairs {
-                        // Take max across all regions in this scan — the real
-                        // inventory stack is always the largest value seen.
-                        let e = resources.entry(path).or_insert(qty);
-                        if qty > *e { *e = qty; }
+                        resources.entry(path).or_insert(qty);
+                    }
+                } else if res_probe_count < 5 {
+                    res_probe_count += 1;
+                    if let Some(p) = data.windows(COUNT_KEY.len()).position(|w| w == COUNT_KEY) {
+                        let ctx_start = p.saturating_sub(80);
+                        let ctx_end   = data.len().min(p + 160);
+                        let snip: String = data[ctx_start..ctx_end].iter()
+                            .map(|&b| if b >= 0x20 && b < 0x7f { b as char } else { '·' })
+                            .collect();
+                        log_lines.push(format!("  [res-probe#{}] {}", res_probe_count, snip));
+                    }
+                }
+
+                if mastery_rank.is_none() {
+                    mastery_rank = scan_mastery_rank(data);
+                }
+
+                // ── Scanner 1b: Mods / Arcanes ────────────────────────────────
+                let mod_pairs = scan_inventory_mods(data);
+                if !mod_pairs.is_empty() {
+                    log_lines.push(format!("  [mods] count={}", mod_pairs.len()));
+                    for (path, qty) in mod_pairs {
+                        resources.entry(path).or_insert(qty);
                     }
                 }
             }
 
-            // ── Mastery rank — same marker check as Scanner 1 ─────────────────
-            if mastery_rank.is_none() && has_inventory {
-                mastery_rank = scan_mastery_rank(data);
-            }
-
-            // ── Scanner 3: Pending recipes (no size limit)
-            {
-                // Diagnostic: log any region containing "$numberLong" to verify data presence
-                if data.windows(12).any(|w| w == b"$numberLong\"") {
-                    let hits = scan_pending_recipes(data);
-                    log_lines.push(format!(
-                        "  [numlong]   0x{:010x} size={} crafting_hits={}",
-                        base, bytes_read, hits.len()
-                    ));
-                    for h in hits { pending_recipes.push(h); }
+            // ── Scanner 3: Pending recipes ────────────────────────────────────
+            if has_number_long {
+                let hits = scan_pending_recipes(data);
+                if !hits.is_empty() {
+                    log_lines.push(format!("  [crafting] {} active recipes", hits.len()));
                 }
+                for h in hits { pending_recipes.push(h); }
             }
 
             // ── Scanner 2: Unique items ───────────────────────────────────────
-            let unique_hits = scan_inventory_unique(data, &unique_ac);
+            let unique_hits = if has_lotus_type { scan_inventory_unique(data, &unique_ac) } else { vec![] };
             if !unique_hits.is_empty() {
                 let preview: String = unique_hits.iter().take(4)
                     .map(|(li, _)| unique_item_paths[*li].split('/').last().unwrap_or("?"))
                     .collect::<Vec<_>>().join(", ");
                 log_lines.push(format!(
-                    "  [unique]    0x{:010x} count={:>4}  {}{}",
-                    base, unique_hits.len(), preview,
-                    if unique_hits.len() > 4 { format!(" …+{}", unique_hits.len()-4) } else { String::new() }
+                    "  [unique] count={}  {}{}",
+                    unique_hits.len(), preview,
+                    if unique_hits.len() > 4 { format!(" +{} more", unique_hits.len()-4) } else { String::new() }
                 ));
                 let n = unique_hits.len();
                 for &(local_idx, rank) in &unique_hits {
@@ -601,7 +883,13 @@ pub fn scan_warframe_memory(unique_names: &[String], display_names: &[String], a
                     }
                 }
             }
+            } // end chunk loop
         }
+
+        log_lines.push(format!(
+            "  [scan-done] elapsed={}ms regions={}",
+            start_time.elapsed().as_millis(), regions_scanned
+        ));
 
         CloseHandle(process);
     }
@@ -626,6 +914,9 @@ pub fn scan_warframe_memory(unique_names: &[String], display_names: &[String], a
 
     for (path, _n) in &unique {
         if resources.contains_key(path) { continue; }
+        // Subsumed warframes appear in ConsumedSuits memory — skip them so they
+        // are not reported as owned unique items.
+        if consumed_suits_out.contains(path) { continue; }
         if let Some(name) = display_map.get(path) {
             items_found.push(FoundItem {
                 unique_name: path.clone(),
@@ -650,7 +941,7 @@ pub fn scan_warframe_memory(unique_names: &[String], display_names: &[String], a
         else { false }
     });
 
-    ScanResult { warframe_running: true, items_found, pending_recipes, mastery_rank, mastery_data: mastery_data_out, regions_scanned, error: None, log_lines, relic_rewards: None }
+    ScanResult { warframe_running: true, items_found, pending_recipes, mastery_rank, mastery_data: mastery_data_out, regions_scanned, error: None, log_lines, relic_rewards: None, resume_addr: resume_addr_out, hot_addrs: hot_addrs_out, consumed_suits: consumed_suits_out }
 }
 
 #[cfg(target_os = "windows")]
@@ -658,6 +949,243 @@ pub fn find_warframe_pid_pub() -> Option<u32> { find_warframe_pid() }
 
 #[cfg(not(target_os = "windows"))]
 pub fn find_warframe_pid_pub() -> Option<u32> { None }
+
+// ─── Raw memory format probe ──────────────────────────────────────────────────
+//
+// Scans Warframe's memory and returns raw text context around every occurrence
+// of a set of known strings.  Capped at max_hits total.  Used to reverse-engineer
+// the actual JSON format for inventory items without any parsing assumptions.
+
+#[cfg(target_os = "windows")]
+pub fn dump_inventory_regions(max_hits: usize) -> Vec<String> {
+    use std::ffi::c_void;
+    use std::mem;
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        System::{
+            Diagnostics::Debug::ReadProcessMemory,
+            Memory::{VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS},
+            Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
+        },
+    };
+
+    // Patterns to search for — ordered by diagnostic value.
+    // "MiscItems":[{ marks the beginning of the actual inventory JSON array from DE's API
+    // response (the most useful single needle for finding the real JSON blob).
+    const NEEDLES: &[&[u8]] = &[
+        b"\"MiscItems\":[{",      // inventory JSON array start — best diagnostic
+        b"\"ItemCount\":",
+        b"MiscItems",
+        b"AlloyPlate",
+        b"Circuits\"",
+        b"/Lotus/Types/Items/MiscItems/",
+    ];
+
+    let pid = match find_warframe_pid() {
+        Some(p) => p,
+        None => return vec!["Warframe not running".to_string()],
+    };
+
+    let process = unsafe { OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, 0, pid) };
+    if process == 0 { return vec!["OpenProcess failed".to_string()]; }
+
+    let mut results: Vec<String> = Vec::new();
+    let mut addr: usize = 0x10000;
+    let mbi_size = mem::size_of::<MEMORY_BASIC_INFORMATION>();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+
+    'outer: while std::time::Instant::now() < deadline && results.len() < max_hits {
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { mem::zeroed() };
+        if unsafe { VirtualQueryEx(process, addr as *const c_void, &mut mbi, mbi_size) } == 0 { break; }
+        let region_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+        if region_end <= addr { break; }
+        addr = region_end;
+
+        if mbi.State != MEM_COMMIT { continue; }
+        let p = mbi.Protect;
+        if p & PAGE_NOACCESS != 0 || p & PAGE_GUARD != 0 { continue; }
+        if p == 0x10 || p == 0x20 { continue; }    // skip executable (code) pages
+        // Skip tiny or enormous regions; read large regions in 64 MB chunks
+        const MAX_REGION: usize = 256 * 1024 * 1024;
+        const CHUNK_SIZE: usize =  64 * 1024 * 1024;
+        if mbi.RegionSize < 4096 || mbi.RegionSize > MAX_REGION { continue; }
+
+        let chunks = if mbi.RegionSize > CHUNK_SIZE {
+            (mbi.RegionSize + CHUNK_SIZE - 1) / CHUNK_SIZE
+        } else { 1 };
+
+        'chunk: for chunk_idx in 0..chunks {
+            if results.len() >= max_hits { break 'outer; }
+            if std::time::Instant::now() >= deadline { break 'outer; }
+
+            let chunk_offset = chunk_idx * CHUNK_SIZE;
+            let read_size    = CHUNK_SIZE.min(mbi.RegionSize - chunk_offset);
+            let chunk_addr   = mbi.BaseAddress as usize + chunk_offset;
+
+            let mut buf = vec![0u8; read_size];
+            let mut bytes_read = 0usize;
+            let ok = unsafe {
+                ReadProcessMemory(process, chunk_addr as *const c_void,
+                    buf.as_mut_ptr() as *mut c_void, read_size, &mut bytes_read)
+            };
+            if ok == 0 || bytes_read < 8 { continue 'chunk; }
+            let data = &buf[..bytes_read];
+
+        for needle in NEEDLES {
+            if results.len() >= max_hits { break 'outer; }
+            if let Some(pos) = data.windows(needle.len()).position(|w| w == *needle) {
+                let ctx_start = pos.saturating_sub(80);
+                let ctx_end   = data.len().min(pos + 200);
+                let snip: String = data[ctx_start..ctx_end].iter()
+                    .map(|&b| if b >= 0x20 && b < 0x7f { b as char } else { '·' })
+                    .collect();
+                results.push(format!(
+                    "0x{:012x}  needle=\"{}\"  ctx: {}",
+                    chunk_addr + ctx_start,
+                    String::from_utf8_lossy(needle),
+                    snip
+                ));
+                // Also grab up to 2 more occurrences of the same needle in this chunk
+                let mut search = pos + needle.len();
+                let mut extra = 0;
+                while extra < 2 && search + needle.len() <= data.len() {
+                    if let Some(rel) = data[search..].windows(needle.len()).position(|w| w == *needle) {
+                        let p2 = search + rel;
+                        let s2 = p2.saturating_sub(80);
+                        let e2 = data.len().min(p2 + 200);
+                        let snip2: String = data[s2..e2].iter()
+                            .map(|&b| if b >= 0x20 && b < 0x7f { b as char } else { '·' })
+                            .collect();
+                        results.push(format!(
+                            "0x{:012x}  needle=\"{}\"  ctx: {}",
+                            chunk_addr + s2,
+                            String::from_utf8_lossy(needle),
+                            snip2
+                        ));
+                        search = p2 + needle.len();
+                        extra += 1;
+                    } else { break; }
+                }
+            }
+        }
+        } // end 'chunk loop
+    }
+
+    unsafe { CloseHandle(process); }
+    if results.is_empty() { results.push("No matches found".to_string()); }
+    results
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn dump_inventory_regions(_max_hits: usize) -> Vec<String> {
+    vec!["Only supported on Windows".to_string()]
+}
+
+// ─── Continuous raw memory string dump ───────────────────────────────────────
+//
+// Scans every committed readable region in the Warframe process and extracts
+// every run of 12+ consecutive printable ASCII bytes.  Each string is written
+// to `out_file` as: `0xADDR  <string>\n`.  No needle filtering — everything.
+//
+// Designed to be called repeatedly from a loop: one call = one full pass.
+// Returns the number of strings written this pass, or an error string.
+//
+// Large regions (>64 MB) are read in 64 MB chunks so the heap stays bounded.
+// The caller is responsible for not holding the file lock across sleeps.
+
+#[cfg(target_os = "windows")]
+pub fn raw_scan_pass(out: &mut impl std::io::Write) -> Result<usize, String> {
+    use std::ffi::c_void;
+    use std::mem;
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        System::{
+            Diagnostics::Debug::ReadProcessMemory,
+            Memory::{VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS},
+            Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
+        },
+    };
+
+    const MIN_LEN:  usize = 8;
+    const CHUNK:    usize = 64 * 1024 * 1024;
+    const TIMEOUT:  u64   = 600; // 10 minutes — full coverage over full scan
+
+    let pid = find_warframe_pid().ok_or("Warframe not running")?;
+    let process = unsafe { OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, 0, pid) };
+    if process == 0 { return Err("OpenProcess failed".into()); }
+
+    let mut addr: usize = 0x10000;
+    let mbi_size = mem::size_of::<MEMORY_BASIC_INFORMATION>();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT);
+    let mut count = 0usize;
+
+    while std::time::Instant::now() < deadline {
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { mem::zeroed() };
+        if unsafe { VirtualQueryEx(process, addr as *const c_void, &mut mbi, mbi_size) } == 0 { break; }
+        let region_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+        if region_end <= addr { break; }
+        addr = region_end;
+
+        if mbi.State != MEM_COMMIT { continue; }
+        let p = mbi.Protect;
+        if p & PAGE_NOACCESS != 0 || p & PAGE_GUARD != 0 { continue; }
+        // Only skip pure-execute (no read bit) — PAGE_EXECUTE_READ (0x20) is kept
+        // because game DLL const-string sections use that protection.
+        if p == 0x10 { continue; }
+
+        let chunks = (mbi.RegionSize + CHUNK - 1) / CHUNK;
+        for ci in 0..chunks {
+            if std::time::Instant::now() >= deadline { break; }
+            let off        = ci * CHUNK;
+            let read_size  = CHUNK.min(mbi.RegionSize - off);
+            let chunk_base = mbi.BaseAddress as usize + off;
+
+            let mut buf = vec![0u8; read_size];
+            let mut bytes_read = 0usize;
+            let ok = unsafe {
+                ReadProcessMemory(process, chunk_base as *const c_void,
+                    buf.as_mut_ptr() as *mut c_void, read_size, &mut bytes_read)
+            };
+            if ok == 0 || bytes_read < MIN_LEN { continue; }
+
+            // Extract printable ASCII runs of MIN_LEN+
+            let data = &buf[..bytes_read];
+            let mut run_start: Option<usize> = None;
+            for (i, &b) in data.iter().enumerate() {
+                let printable = b >= 0x20 && b < 0x7f;
+                if printable {
+                    if run_start.is_none() { run_start = Some(i); }
+                } else {
+                    if let Some(s) = run_start.take() {
+                        let len = i - s;
+                        if len >= MIN_LEN {
+                            let s_str = std::str::from_utf8(&data[s..i]).unwrap_or("?");
+                            let _ = writeln!(out, "0x{:012x}  {}", chunk_base + s, s_str);
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            // flush any run that reaches end of chunk
+            if let Some(s) = run_start {
+                let len = bytes_read - s;
+                if len >= MIN_LEN {
+                    let s_str = std::str::from_utf8(&data[s..bytes_read]).unwrap_or("?");
+                    let _ = writeln!(out, "0x{:012x}  {}", chunk_base + s, s_str);
+                    count += 1;
+                }
+            }
+        }
+    }
+
+    unsafe { CloseHandle(process); }
+    Ok(count)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn raw_scan_pass(_out: &mut impl std::io::Write) -> Result<usize, String> {
+    Err("Only supported on Windows".into())
+}
 
 // ─── Riven validity flag scanner ──────────────────────────────────────────────
 //
@@ -754,35 +1282,37 @@ pub fn find_riven_validity_va(_pid: u32) -> Option<usize> { None }
 
 #[cfg(target_os = "windows")]
 fn find_warframe_pid() -> Option<u32> {
+    use std::mem;
     use windows_sys::Win32::{
-        Foundation::CloseHandle,
-        System::{
-            ProcessStatus::{EnumProcesses, K32GetModuleBaseNameA},
-            Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
+        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+        System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32First, Process32Next,
+            PROCESSENTRY32, TH32CS_SNAPPROCESS,
         },
     };
+    // CreateToolhelp32Snapshot gives process names without needing OpenProcess,
+    // so EAC blocking read access on the game process doesn't prevent detection.
     unsafe {
-        let mut pids = vec![0u32; 2048];
-        let mut needed = 0u32;
-        if EnumProcesses(pids.as_mut_ptr(), (pids.len() * 4) as u32, &mut needed) == 0 {
-            return None;
-        }
-        let count = needed as usize / 4;
-        for &pid in &pids[..count] {
-            if pid == 0 { continue; }
-            let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
-            if handle == 0 { continue; }
-            let mut name_buf = [0u8; 260];
-            let len = K32GetModuleBaseNameA(handle, 0, name_buf.as_mut_ptr(), name_buf.len() as u32);
-            CloseHandle(handle);
-            if len > 0 {
-                let name = std::str::from_utf8(&name_buf[..len as usize]).unwrap_or("").to_lowercase();
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE { return None; }
+
+        let mut entry: PROCESSENTRY32 = mem::zeroed();
+        entry.dwSize = mem::size_of::<PROCESSENTRY32>() as u32;
+
+        let mut found = None;
+        if Process32First(snapshot, &mut entry) != 0 {
+            loop {
+                let name_len = entry.szExeFile.iter().position(|&b| b == 0).unwrap_or(260);
+                let name = String::from_utf8_lossy(&entry.szExeFile[..name_len]).to_lowercase();
                 if name.starts_with("warframe") && !name.contains("launcher") {
-                    return Some(pid);
+                    found = Some(entry.th32ProcessID);
+                    break;
                 }
+                if Process32Next(snapshot, &mut entry) == 0 { break; }
             }
         }
-        None
+        CloseHandle(snapshot);
+        found
     }
 }
 

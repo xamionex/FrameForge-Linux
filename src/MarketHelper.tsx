@@ -20,6 +20,19 @@ interface WfmPrice { url_name: string; sell_median?: number; }
 
 interface CraftingJob { unique_name: string; item_name: string; completion_ms: number; }
 
+export interface MarketFilters {
+  search: string;
+  ownership:  ("owned" | "notowned")[];
+  conditions: ("dupes" | "itemowned" | "fullset" | "hasparts")[];
+  vault:      ("vaulted" | "unvaulted")[];
+  sortMode:   "plat" | "ducats" | "az" | "za";
+  activeMarketTab: "sets" | "trading";
+}
+export const MARKET_FILTERS_DEFAULT: MarketFilters = {
+  search: "", ownership: [], conditions: [], vault: [], sortMode: "ducats",
+  activeMarketTab: "sets",
+};
+
 interface Props {
   quantities: Record<string, number>;
   /** API-only quantities — used for ownership checks (more reliable than scanner). */
@@ -27,6 +40,12 @@ interface Props {
   refreshKey: number;
   crafting: CraftingJob[];
   onWfmLoginChange?: (loggedIn: boolean) => void;
+  filters: MarketFilters;
+  onFiltersChange: (f: MarketFilters) => void;
+}
+
+function toggle<T>(arr: T[], val: T): T[] {
+  return arr.includes(val) ? arr.filter(x => x !== val) : [...arr, val];
 }
 
 // ─── Icons ────────────────────────────────────────────────────────────────────
@@ -150,30 +169,21 @@ function SetCard({ setKey, parts, parentItem, setPrice, setPriceLoading, pricesF
 
 // ─── Market Helper ────────────────────────────────────────────────────────────
 
-type SortMode = "name" | "ducats-owned" | "ducats-all" | "completion";
-
-export default function MarketHelper({ quantities, apiQuantities, refreshKey, crafting, onWfmLoginChange }: Props) {
-  const [allItems, setAllItems]         = useState<CatalogItem[]>([]);
-  const [wfmItems, setWfmItems]         = useState<WfmItem[]>([]);
-  const [wfmLoading, setWfmLoading]     = useState(false);
-  const [wfmError, setWfmError]         = useState(false);
-  const [prices, setPrices]             = useState<Map<string, WfmPrice>>(new Map());
-  const [priceAges, setPriceAges]       = useState<Map<string, number>>(new Map()); // urlName → fetchedAt ms
+export default function MarketHelper({ quantities, apiQuantities, refreshKey, crafting, onWfmLoginChange, filters, onFiltersChange }: Props) {
+  const [allItems, setAllItems]           = useState<CatalogItem[]>([]);
+  const [wfmItems, setWfmItems]           = useState<WfmItem[]>([]);
+  const [wfmLoading, setWfmLoading]       = useState(false);
+  const [wfmError, setWfmError]           = useState(false);
+  const [prices, setPrices]               = useState<Map<string, WfmPrice>>(new Map());
+  const [priceAges, setPriceAges]         = useState<Map<string, number>>(new Map());
   const [loadingPrices, setLoadingPrices] = useState<Set<string>>(new Set());
+  const [wfmBadge, setWfmBadge]           = useState(0);
+  const [wfmUsername, setWfmUsername]     = useState<string | null>(null);
+  const [popup, setPopup] = useState<{ urlName: string; displayName: string; imageName?: string } | null>(null);
 
   const PRICE_CACHE_KEY = "ff-wfm-prices-v1";
-  const [activeMarketTab, setActiveMarketTab] = useState<"sets" | "trading">("sets");
-  const [wfmBadge, setWfmBadge]               = useState(0);
-  const [wfmUsername, setWfmUsername]         = useState<string | null>(null);
-  const [popup, setPopup] = useState<{ urlName: string; displayName: string; imageName?: string } | null>(null);
-  const [search, setSearch]             = useState("");
-  const [sortMode, setSortMode]         = useState<SortMode>("ducats-owned");
-
-  // Mix-and-match filters
-  const [filterHasParts,  setFilterHasParts]  = useState(true);
-  const [filterDupes,     setFilterDupes]     = useState(false);
-  const [filterComplete,  setFilterComplete]  = useState(false);
-  const [filterFullOwned, setFilterFullOwned] = useState(false);
+  const { search, ownership, conditions, vault, sortMode, activeMarketTab } = filters;
+  const set = <K extends keyof MarketFilters>(k: K, v: MarketFilters[K]) => onFiltersChange({ ...filters, [k]: v });
 
   useEffect(() => {
     invoke<CatalogItem[]>("get_all_items").then(setAllItems).catch(() => {});
@@ -437,47 +447,67 @@ export default function MarketHelper({ quantities, apiQuantities, refreshKey, cr
     return Array.from(sets.entries())
       .filter(([key]) => !q || key.toLowerCase().includes(q))
       .filter(([key, parts]) => {
-        const ownedAny    = parts.some(p => (quantities[p.unique_name] ?? 0) > 0);
-        const hasDupes    = parts.some(p => (quantities[p.unique_name] ?? 0) > 1);
-        const isComplete  = parts.every(p => (quantities[p.unique_name] ?? 0) > 0);
-        const parent      = parentItems.get(key);
-        // Use API-only quantities for ownership — the scanner can pick up warframe
-        // paths from navigation/showcase screens and create false positives.
-        const isFullOwned = parent ? (apiQuantities[parent.unique_name] ?? 0) > 0 : false;
-        if (filterHasParts  && !ownedAny)    return false;
-        if (filterDupes     && !hasDupes)    return false;
-        if (filterComplete  && !isComplete)  return false;
-        if (filterFullOwned && !isFullOwned) return false;
+        const ownedAny   = parts.some(p => (quantities[p.unique_name] ?? 0) > 0);
+        const parent     = parentItems.get(key);
+
+        // Group 1: Owned / Not Owned
+        if (ownership.length > 0 && ownership.length < 2) {
+          if (ownership.includes("owned")    && !ownedAny) return false;
+          if (ownership.includes("notowned") &&  ownedAny) return false;
+        }
+
+        // Group 2: specific conditions (OR — set matches if it satisfies ANY selected)
+        if (conditions.length > 0) {
+          const hasDupes   = parts.some(p => (quantities[p.unique_name] ?? 0) > 1);
+          const isFullSet  = parts.every(p => (quantities[p.unique_name] ?? 0) > 0);
+          // Use API quantities for Item Owned — scanner can create false positives from menus
+          const isItemOwned = parent ? (apiQuantities[parent.unique_name] ?? 0) > 0 : false;
+          const ok = conditions.some(c =>
+            (c === "hasparts"  && ownedAny)    ||
+            (c === "dupes"     && hasDupes)    ||
+            (c === "fullset"   && isFullSet)   ||
+            (c === "itemowned" && isItemOwned)
+          );
+          if (!ok) return false;
+        }
+
+        // Group 3: Vaulted / Unvaulted
+        if (vault.length > 0 && vault.length < 2) {
+          const isVaulted = parent
+            ? parent.vaulted === true
+            : parts.some(p => p.vaulted === true);
+          if (vault.includes("vaulted")   && !isVaulted) return false;
+          if (vault.includes("unvaulted") &&  isVaulted) return false;
+        }
+
         return true;
       })
       .sort(([aKey, aParts], [bKey, bParts]) => {
-        if (sortMode === "ducats-owned") {
+        if (sortMode === "ducats") {
           const ad = aParts.reduce((s, p) => s + (p.ducats ?? 0) * (quantities[p.unique_name] ?? 0), 0);
           const bd = bParts.reduce((s, p) => s + (p.ducats ?? 0) * (quantities[p.unique_name] ?? 0), 0);
-          return bd - ad;
+          return bd - ad || aKey.localeCompare(bKey);
         }
-        if (sortMode === "ducats-all") {
-          const ad = aParts.reduce((s, p) => s + (p.ducats ?? 0), 0);
-          const bd = bParts.reduce((s, p) => s + (p.ducats ?? 0), 0);
-          return bd - ad;
+        if (sortMode === "plat") {
+          const getSetPrice = (key: string) => {
+            const url = wfmLookup.get(normalizeForWfm(key + " Set")) ?? normalizeForWfm(key + " Set");
+            return prices.get(url)?.sell_median ?? 0;
+          };
+          return getSetPrice(bKey) - getSetPrice(aKey) || aKey.localeCompare(bKey);
         }
-        if (sortMode === "completion") {
-          const ar = aParts.filter(p => (quantities[p.unique_name] ?? 0) > 0).length / aParts.length;
-          const br = bParts.filter(p => (quantities[p.unique_name] ?? 0) > 0).length / bParts.length;
-          return br - ar || aKey.localeCompare(bKey);
-        }
-        return aKey.localeCompare(bKey);
+        if (sortMode === "za") return bKey.localeCompare(aKey);
+        return aKey.localeCompare(bKey); // az
       });
-  }, [sets, quantities, filterHasParts, filterDupes, filterComplete, filterFullOwned, sortMode, search, parentItems]);
+  }, [sets, quantities, apiQuantities, ownership, conditions, vault, sortMode, search, parentItems, prices, wfmLookup]);
 
   return (
     <div className="market-helper">
       {/* ── Market tab strip ── */}
       <div className="market-tab-strip">
-        <button className={activeMarketTab === "sets" ? "active" : ""} onClick={() => setActiveMarketTab("sets")}>
+        <button className={activeMarketTab === "sets" ? "active" : ""} onClick={() => set("activeMarketTab", "sets")}>
           Prime Sets
         </button>
-        <button className={activeMarketTab === "trading" ? "active" : ""} onClick={() => { setActiveMarketTab("trading"); setWfmBadge(0); }}>
+        <button className={activeMarketTab === "trading" ? "active" : ""} onClick={() => { set("activeMarketTab", "trading"); setWfmBadge(0); }}>
           Trading {wfmBadge > 0 && <span className="market-tab-badge">{wfmBadge}</span>}
         </button>
       </div>
@@ -495,18 +525,26 @@ export default function MarketHelper({ quantities, apiQuantities, refreshKey, cr
       {activeMarketTab === "sets" && <>
       <div className="market-header">
         <input className="foundry-search" style={{ width: 200 }} placeholder="Search sets…"
-          value={search} onChange={e => setSearch(e.target.value)} />
-        <div className="filter-bar" style={{ border: "none", padding: 0, flex: 1 }}>
-          <button className={`fchip ${filterHasParts  ? "fchip-on" : ""}`} onClick={() => setFilterHasParts(v => !v)}>Has parts</button>
-          <button className={`fchip ${filterDupes     ? "fchip-on" : ""}`} onClick={() => setFilterDupes(v => !v)}>★ Dupes</button>
-          <button className={`fchip ${filterComplete  ? "fchip-on" : ""}`} onClick={() => setFilterComplete(v => !v)}>✓ Complete set</button>
-          <button className={`fchip ${filterFullOwned ? "fchip-on" : ""}`} onClick={() => setFilterFullOwned(v => !v)}>🗸 Item owned</button>
+          value={search} onChange={e => set("search", e.target.value)} />
+        <div className="filter-bar" style={{ border: "none", padding: 0, flex: 1, flexWrap: "wrap" }}>
+          <button className={`fchip ${ownership.includes("owned")    ? "fchip-on" : ""}`} onClick={() => set("ownership", toggle(ownership, "owned"))}>Owned</button>
+          <button className={`fchip ${ownership.includes("notowned") ? "fchip-on" : ""}`} onClick={() => set("ownership", toggle(ownership, "notowned"))}>Not Owned</button>
+          <span className="fbar-sep"/>
+          <button className={`fchip ${conditions.includes("dupes")     ? "fchip-on" : ""}`} onClick={() => set("conditions", toggle(conditions, "dupes"))}>Dupes</button>
+          <button className={`fchip ${conditions.includes("itemowned") ? "fchip-on" : ""}`} onClick={() => set("conditions", toggle(conditions, "itemowned"))}>Item Owned</button>
+          <button className={`fchip ${conditions.includes("fullset")   ? "fchip-on" : ""}`} onClick={() => set("conditions", toggle(conditions, "fullset"))}>Full Set</button>
+          <button className={`fchip ${conditions.includes("hasparts")  ? "fchip-on" : ""}`} onClick={() => set("conditions", toggle(conditions, "hasparts"))}>Has Parts</button>
+          <span className="fbar-sep"/>
+          <button className={`fchip ${vault.includes("vaulted")   ? "fchip-on" : ""}`} onClick={() => set("vault", toggle(vault, "vaulted"))}>Vaulted</button>
+          <button className={`fchip ${vault.includes("unvaulted") ? "fchip-on" : ""}`} onClick={() => set("vault", toggle(vault, "unvaulted"))}>Unvaulted</button>
           <span className="fbar-sep"/>
           <span className="fbar-label">Sort:</span>
-          <button className={`fchip ${sortMode === "name"        ? "fchip-on" : ""}`} onClick={() => setSortMode("name")}>A-Z</button>
-          <button className={`fchip ${sortMode === "ducats-owned"? "fchip-on" : ""}`} onClick={() => setSortMode("ducats-owned")}>Ducats owned</button>
-          <button className={`fchip ${sortMode === "ducats-all"  ? "fchip-on" : ""}`} onClick={() => setSortMode("ducats-all")}>Ducats potential</button>
-          <button className={`fchip ${sortMode === "completion"  ? "fchip-on" : ""}`} onClick={() => setSortMode("completion")}>% Complete</button>
+          <button className={`fchip ${sortMode === "plat"   ? "fchip-on" : ""}`} onClick={() => set("sortMode", "plat")}>Most Plat</button>
+          <button className={`fchip ${sortMode === "ducats" ? "fchip-on" : ""}`} onClick={() => set("sortMode", "ducats")}>Most Ducats</button>
+          <button className={`fchip ${sortMode === "az"     ? "fchip-on" : ""}`} onClick={() => set("sortMode", "az")}>A–Z</button>
+          <button className={`fchip ${sortMode === "za"     ? "fchip-on" : ""}`} onClick={() => set("sortMode", "za")}>Z–A</button>
+          <span className="fbar-sep"/>
+          <button className="fchip fchip-reset" onClick={() => onFiltersChange(MARKET_FILTERS_DEFAULT)}>Show All</button>
           <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--muted)" }}>{visibleSets.length} sets</span>
           <HelpTip items={[
             { swatch: "rgba(240,192,64,.5)", icon: "✓", label: "Complete set", desc: "Gold border + ✓ — all parts in inventory" },

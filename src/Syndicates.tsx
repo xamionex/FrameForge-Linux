@@ -115,17 +115,26 @@ function StatusBadge({ status }: { status: CompStatus }) {
 
 // ── Main component ────────────────────────────────────────────────────────────
 
+export interface SyndicateFilters {
+  activeGroup: SynGroup; activeTab: string; missingOnly: boolean; search: string;
+}
+export const SYNDICATE_FILTERS_DEFAULT: SyndicateFilters = {
+  activeGroup: "main", activeTab: "Steel Meridian", missingOnly: false, search: "",
+};
+
 interface Props {
   quantities: Record<string, number>;
+  filters: SyndicateFilters;
+  onFiltersChange: (f: SyndicateFilters) => void;
 }
 
-export default function Syndicates({ quantities }: Props) {
-  const [stores, setStores]           = useState<SyndicateStore[]>([]);
-  const [loading, setLoading]         = useState(true);
-  const [activeGroup, setActiveGroup] = useState<SynGroup>("main");
-  const [activeTab, setActiveTab]     = useState("Steel Meridian");
-  const [missingOnly, setMissingOnly] = useState(false);
-  const [search, setSearch]           = useState("");
+export default function Syndicates({ quantities, filters, onFiltersChange }: Props) {
+  const [stores, setStores] = useState<SyndicateStore[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  const { activeGroup, activeTab, missingOnly, search } = filters;
+  const set = <K extends keyof SyndicateFilters>(k: K, v: SyndicateFilters[K]) => onFiltersChange({ ...filters, [k]: v });
+  const isFiltered = search !== "" || missingOnly;
 
   useEffect(() => {
     invoke<SyndicateStore[]>("get_syndicate_stores")
@@ -139,17 +148,13 @@ export default function Syndicates({ quantities }: Props) {
     [stores, activeGroup]
   );
 
-  // Reset active tab when group changes
   const handleGroupChange = (g: SynGroup) => {
-    setActiveGroup(g);
-    setSearch("");
     const first = stores.find(s => (SYNDICATE_META[s.name]?.group ?? "other") === g);
-    if (first) setActiveTab(first.name);
+    onFiltersChange({ ...filters, activeGroup: g, search: "", activeTab: first?.name ?? filters.activeTab });
   };
 
   const handleTabChange = (name: string) => {
-    setActiveTab(name);
-    setSearch("");
+    onFiltersChange({ ...filters, activeTab: name, search: "" });
   };
 
   const activeStore = useMemo(() => {
@@ -246,7 +251,7 @@ export default function Syndicates({ quantities }: Props) {
           className="syn-search"
           placeholder="Search items…"
           value={search}
-          onChange={e => setSearch(e.target.value)}
+          onChange={e => set("search", e.target.value)}
         />
         <div className="syn-progress-wrap">
           <div className="syn-progress-bar">
@@ -260,10 +265,15 @@ export default function Syndicates({ quantities }: Props) {
         <button
           className={`syn-filter-btn ${missingOnly ? "active" : ""}`}
           style={missingOnly ? { ["--syn-color" as string]: meta?.color } as React.CSSProperties : undefined}
-          onClick={() => setMissingOnly(v => !v)}
+          onClick={() => set("missingOnly", !missingOnly)}
         >
           Missing only
         </button>
+        {isFiltered && (
+          <button className="fchip fchip-reset" onClick={() => onFiltersChange({ ...filters, missingOnly: false, search: "" })}>
+            Show All
+          </button>
+        )}
       </div>
 
       {/* ── Item list ── */}

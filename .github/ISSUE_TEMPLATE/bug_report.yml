@@ -1,0 +1,76 @@
+name: 🐛 Bug Report
+description: Something is broken, crashing, or acting weird.
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please fill out every field so we can reproduce and fix it without back-and-forth.
+
+  - type: input
+    id: app_version
+    attributes:
+      label: App Version
+      description: Open the Settings tab and scroll to the bottom.
+      placeholder: e.g. 1.8.0
+    validations:
+      required: true
+
+  - type: input
+    id: warframe_build
+    attributes:
+      label: Warframe Build
+      description: Found in the Warframe launcher or bottom-left of the main menu.
+      placeholder: e.g. 2999.15.12.0
+    validations:
+      required: false
+
+  - type: dropdown
+    id: windows_version
+    attributes:
+      label: Windows Version
+      options:
+        - Windows 11
+        - Windows 10
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: What happened? Be as specific as possible.
+      placeholder: Describe the bug clearly.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: Walk us through exactly what you did.
+      placeholder: |
+        1. Open the app
+        2. Navigate to ...
+        3. Click on ...
+        4. See the error
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Result
+      description: What should have happened instead?
+      placeholder: Describe what you expected to see.
+    validations:
+      required: true
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots / Logs
+      description: Attach screenshots, error messages, or log files here. You can drag and drop files directly into this box.
+      placeholder: Paste logs or drag-and-drop screenshots here.
+    validations:
+      required: false

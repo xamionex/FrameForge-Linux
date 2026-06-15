@@ -1,5 +1,4 @@
-# FrameForge — Warframe Companion `v1.8.0`
-(Release v1.8.0)
+# FrameForge — Warframe Companion `v1.9.0`
 
 A desktop companion for Warframe that shows your live inventory, tracks crafting recipes, displays market prices, runs a full trading desk, manages a live timer dashboard, auto-detects relic reward screens, and analyses riven mods — all without modifying the game.
 
@@ -10,12 +9,18 @@ A desktop companion for Warframe that shows your live inventory, tracks crafting
 ## Features
 
 ### Live Inventory Scanning
-Your inventory is read directly from the Warframe process memory every 10 seconds across 13 item categories — resources, mods, arcanes, relics, weapons, Warframes, companions, warframe blueprints, weapon component blueprints, crafted warframe parts, and more. No login required. The scanner is **strictly read-only**: it uses `ReadProcessMemory`, the same Windows API used by Overwolf and hardware monitors. It never writes to memory, injects code, or modifies the game.
+Your inventory is read directly from the Warframe process memory across 13 item categories — resources, mods, arcanes, relics, weapons, Warframes, companions, warframe blueprints, weapon component blueprints, crafted warframe parts, and more. No login required. The scanner is **strictly read-only**: it uses `ReadProcessMemory`, the same Windows API used by Overwolf and hardware monitors. It never writes to memory, injects code, or modifies the game.
+
+The scanner runs in 15-second rolling windows that carry over between cycles so it can cover all of Warframe's memory without stalling the UI. Inventory addresses are cached to disk so subsequent scans find your items almost instantly.
+
+Subsumed warframes (consumed by Helminth) are automatically detected and shown as unowned — they no longer appear as gold in the Foundry.
 
 A quantity change log records every item gain and loss with timestamps.
 
 ### Foundry — Recipe Browser & Tracker
 Browse every craftable item with full ingredient trees. Each component is colour-coded by status (owned, blueprint only, missing) and shows which relics drop it. Star items to **track** them in the Modular Window, which shows a per-item breakdown of exactly what you still need to farm.
+
+Filter chips let you narrow down by: **Prime**, **Vaulted / Unvaulted**, **Owned / Unowned**, **Ready to build**, and **Mastered / Unmastered**. Filters and search are preserved when switching to other tabs and back.
 
 ### Market Helper — Prime Sets
 Browse every Prime set with live platinum prices from [warframe.market](https://warframe.market). Shows total set value, per-part pricing, ducat values, and your ownership status. Click any set card or individual part to open a **live order popup** showing:
@@ -64,7 +69,7 @@ The header shows three live connection chips so you always know what's running:
 
 | Chip | States |
 |---|---|
-| **Scanner** | OFF · Idle · No game · Active `HH:MM` (last scan time) |
+| **Memory** | OFF · Idle · No Game · Scanning |
 | **WF API** | OFF · Waiting · Connecting… (clickable retry) · Connected `HH:MM` |
 | **WFM** | Not logged in (clickable → Market tab) · Online |
 
@@ -175,11 +180,12 @@ pnpm tauri build
 
 ### Memory Scanning (`memory_scanner.rs`)
 FrameForge enumerates committed, readable memory regions of the Warframe process using `VirtualQueryEx` and reads them with `ReadProcessMemory`. Three independent pattern matchers run over each region:
-- **Resource scanner** — stackable items via JSON patterns like `"ItemCount":N,"ItemType":"/Lotus/..."`
+- **Resource scanner** — stackable items via `"ItemCount":N,"ItemType":"/Lotus/..."` JSON patterns
+- **Mod scanner** — mods and arcanes from `RawUpgrades` using backwards brace-depth tracking to handle the `ItemCount → LastAdded → ItemType` field order
 - **Unique scanner** — weapons, Warframes, and companions via Aho-Corasick multi-pattern matching
 - **Pending recipe scanner** — active Foundry jobs via ISO-8601 completion timestamps
 
-A **stability buffer** requires a quantity to appear in two consecutive scans before it is committed. Only `MEM_COMMIT` regions with readable page protection are scanned; regions larger than 128 MB are skipped.
+The scan runs in 15-second rolling windows; `resume_addr` carries over between windows so the full address space is covered progressively without blocking the UI. When the inventory JSON location is found, its address is saved to `inventory_hints.json` and checked first on every subsequent window — making steady-state scans near-instant. Only `MEM_COMMIT` regions with readable page protection are scanned.
 
 ### Timers (`lib.rs`)
 Worldstate data is fetched from `api.warframe.com/cdn/worldState.php`, parsed in Rust into a structured format, and served to the frontend via Tauri IPC. Node names are resolved from the WFCD sol nodes dataset. Event names are resolved from the WFCD localisation dataset.
@@ -241,7 +247,9 @@ See the [LICENSE](LICENSE) file for the full license text.
 
 ## Contributing
 
-Bug reports and pull requests are welcome. Please open an issue before submitting large changes so we can align on the approach first.
+Bug reports, feature requests, and pull requests are welcome via [GitHub Issues](../../issues). Please use the issue templates — they make sure we have all the info needed to reproduce bugs without back-and-forth. For general questions, use [GitHub Discussions](../../discussions).
+
+For code contributions, please open an issue before submitting large changes so we can align on the approach first.
 
 ---
 

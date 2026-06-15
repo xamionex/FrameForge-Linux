@@ -1,6 +1,6 @@
 [package]
 name = "warframe-companion"
-version = "1.8.0"
+version = "1.9.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -29,11 +29,15 @@ native-tls = "0.2"
 whirlpool = "0.10"
 lzma-rs = "0.3"
 
+[profile.dev]
+opt-level = 1
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
     "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Memory",
     "Win32_System_ProcessStatus",
     "Win32_System_Com",

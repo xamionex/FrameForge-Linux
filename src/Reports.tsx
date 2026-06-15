@@ -143,10 +143,14 @@ function ItemImg({ imageName, size = 28 }: { imageName?: string; size?: number }
   return <img style={s} src={`https://cdn.warframestat.us/img/${imageName}`} alt="" loading="lazy" onError={() => setFailed(true)} />;
 }
 
-export default function Reports() {
+interface Props {
+  dateRange: number | "all";
+  onDateRangeChange: (r: number | "all") => void;
+}
+
+export default function Reports({ dateRange, onDateRangeChange }: Props) {
   const [trades, setTrades]         = useState<Trade[]>([]);
   const [loading, setLoading]       = useState(true);
-  const [dateRange, setDateRange]   = useState<number | "all">(30);
   const [topItems, setTopItems]     = useState<WfmTopItem[]>([]);
   const [topLoading, setTopLoading] = useState(true);
 
@@ -299,7 +303,7 @@ export default function Reports() {
           {RANGES.map(r => (
             <button key={String(r.value)}
               className={`rpt-range-btn ${dateRange === r.value ? "rpt-range-active" : ""}`}
-              onClick={() => setDateRange(r.value)}>
+              onClick={() => onDateRangeChange(r.value)}>
               {r.label}
             </button>
           ))}

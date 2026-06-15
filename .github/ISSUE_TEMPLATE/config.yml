@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: ❓ General Question
+    url: https://github.com/Sikewyrm/FrameForge/discussions
+    about: For general questions, use GitHub Discussions. Select the correct app tag and be descriptive in your post title.
