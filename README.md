@@ -1,4 +1,4 @@
-# FrameForge — Warframe Companion `v1.10.0`
+# FrameForge — Warframe Companion `v1.11.0`
 
 A desktop companion for Warframe that shows your live inventory, tracks crafting recipes, displays market prices, runs a full trading desk, manages a live timer dashboard, auto-detects relic reward screens, and analyses riven mods — all without modifying the game.
 
@@ -13,9 +13,13 @@ Your inventory is read directly from the Warframe process memory across 13 item 
 
 The scanner runs in 15-second rolling windows that carry over between cycles so it can cover all of Warframe's memory without stalling the UI. Inventory addresses are cached to disk so subsequent scans find your items almost instantly.
 
-Subsumed warframes (consumed by Helminth) are automatically detected and shown as unowned — they no longer appear as gold in the Foundry.
+Subsumed warframes (consumed by Helminth) are automatically detected and shown as unowned — they no longer appear as gold in the Foundry. The subsumed indicator icon has a red background so it stands out at a glance.
 
 A quantity change log records every item gain and loss with timestamps.
+
+All inventory data — unique items, mods, mastery rank, and Helminth subsumptions — is persisted to disk and restored immediately on next launch, so your inventory is visible the moment FrameForge opens even before a scan completes.
+
+An optional **Inventory Blob Logging** setting (`Settings → Memory Scanner`) saves a timestamped raw snapshot of the inventory JSON from memory to `%LOCALAPPDATA%\warframe-companion\blobs\` on each scan pass. Useful for diagnostics and analysis.
 
 ### Foundry — Recipe Browser & Tracker
 Browse every craftable item with full ingredient trees. Each component is colour-coded by status (owned, blueprint only, missing) and shows which relics drop it. Star items to **track** them in the Modular Window, which shows a per-item breakdown of exactly what you still need to farm.

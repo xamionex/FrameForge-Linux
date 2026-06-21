@@ -20,6 +20,7 @@ pub struct AppState {
     pub relic_drops_cache_path: PathBuf,
     pub relic_rewards_cache_path: PathBuf,
     pub quantities_cache_path: PathBuf,
+    pub inventory_state_cache_path: PathBuf,
     pub settings_path: PathBuf,
     pub log_path: PathBuf,
     pub changes_log_path: PathBuf,
@@ -40,12 +41,18 @@ pub struct AppState {
     /// Stable unique items (weapons/warframes) seen in 2+ consecutive scans.
     /// Exposed so get_current_quantities can return them for overlay ownership checks.
     pub unique_quantities: Arc<Mutex<HashMap<String, i64>>>,
+    /// Mod/arcane inventory: unique_name → {total, by_rank}. Shared with monitor thread.
+    /// API data is merged in when available; falls back to scanner-only totals.
+    pub current_mods: Arc<Mutex<HashMap<String, memory_scanner::ModCount>>>,
     /// Last-known crafting jobs from memory scans. Shared with monitor thread.
     pub current_crafting: Arc<Mutex<Vec<CraftingJob>>>,
     pub monitor_active: Arc<AtomicBool>,
     /// Controls the raw memory string-dump background thread.
     pub raw_scan_active: Arc<AtomicBool>,
     pub raw_scan_path: PathBuf,
+    /// When true, save a timestamped inventory blob to blobs/ on each full scan pass.
+    pub blob_log_enabled: Arc<AtomicBool>,
+    pub blob_log_dir: PathBuf,
     /// WFM slug → median sell price (None = item not listed on WFM). Shared across all windows.
     pub wfm_price_cache: Mutex<HashMap<String, Option<u32>>>,
     /// Active WFM session (JWT + username). Held in memory only, never written to disk.
@@ -337,7 +344,7 @@ async fn fetch_item_list(state: State<'_, AppState>) -> Result<usize, String> {
     if let Ok(json) = serde_json::to_string(&result.relic_rewards) {
         let _ = std::fs::write(&state.relic_rewards_cache_path, json);
     }
-    *state.wfcd_items.lock().map_err(|e| e.to_string())? = patched_items;
+    *state.wfcd_items.lock().map_err(|e| e.to_string())? = dedup_known_aliases(patched_items);
     *state.recipes.lock().map_err(|e| e.to_string())? = result.recipes;
     *state.relic_drops.lock().map_err(|e| e.to_string())? = result.relic_drops;
     *state.relic_rewards.lock().map_err(|e| e.to_string())? = result.relic_rewards;
@@ -2914,6 +2921,19 @@ async fn dump_memory_probe(state: State<'_, AppState>) -> Result<String, String>
 }
 
 /// Toggle the continuous raw memory string-dump.
+/// One-shot manual capture of the full inventory JSON blob.
+#[tauri::command]
+fn capture_inventory_blob(state: State<'_, AppState>) -> Result<String, String> {
+    let path = state.raw_scan_path.with_file_name("inventory_blob.txt");
+    memory_scanner::capture_inventory_blob(&path)
+}
+
+/// Enable or disable automatic per-pass inventory blob logging to blobs/.
+#[tauri::command]
+fn set_blob_log(enabled: bool, state: State<'_, AppState>) {
+    state.blob_log_enabled.store(enabled, Ordering::SeqCst);
+}
+
 /// Returns "started" or "stopped" so the frontend can update button state.
 #[tauri::command]
 async fn toggle_raw_scan(state: State<'_, AppState>) -> Result<String, String> {
@@ -3001,6 +3021,9 @@ pub struct InventoryUpdate {
     /// Warframe unique-name paths from InfestedFoundry.ConsumedSuits (Helminth subsumed).
     /// Non-empty only when the memory scanner found the ConsumedSuits array this window.
     pub consumed_suits: Vec<String>,
+    /// Mod/arcane inventory: unique_name → {total, by_rank}.
+    /// Empty when no scan data available yet; scanner-sourced until API provides rank detail.
+    pub mods: HashMap<String, memory_scanner::ModCount>,
 }
 
 #[tauri::command]
@@ -3039,10 +3062,13 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
     let db_path = state.db_path.clone();
     let log_path = state.log_path.clone();
     let changes_log_path = state.changes_log_path.clone();
-    let quantities_cache_path = state.quantities_cache_path.clone();
+    let inventory_state_cache_path = state.inventory_state_cache_path.clone();
     let shared_quantities = state.current_quantities.clone();
     let shared_unique     = state.unique_quantities.clone();
+    let shared_mods       = state.current_mods.clone();
     let shared_crafting   = state.current_crafting.clone();
+    let blob_log_enabled  = state.blob_log_enabled.clone();
+    let blob_log_dir      = state.blob_log_dir.clone();
     let reward_app = app.clone();  // clone before app is moved into the inventory thread
 
     std::thread::spawn(move || {
@@ -3056,26 +3082,43 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
         let mut known: HashMap<String, i64> =
             shared_quantities.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
+        // Load the full inventory state from the last session so the UI shows data
+        // immediately on restart without waiting for the first full scan pass.
+        let startup_cache = load_inventory_state_cache(&inventory_state_cache_path);
+
         // Stability buffer for unique scanner items (weapons/warframes).
         // explicit_count=false items are never committed to `known`, but two
         // consecutive appearances mean the item is genuinely owned.
-        let mut unique_stable: HashMap<String, u8> = HashMap::new();
+        // Pre-seed with cached confirmed items (count=2 = already confirmed).
+        let mut unique_stable: HashMap<String, u8> = startup_cache.unique_items.keys()
+            .map(|k| (k.clone(), 2u8))
+            .collect();
+
+        // Mod stability: emit a mod count only when the total matches in 2 consecutive scans.
+        // Prevents stale-cache flipping between different RawUpgrades sections.
+        // Pre-load from cache so mod data is visible before the first full scan.
+        let mut known_mods: HashMap<String, memory_scanner::ModCount> =
+            shared_mods.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut prev_mod_totals: HashMap<String, i64> = HashMap::new();
         // Track the last date we recorded daily snapshots (YYYY-MM-DD).
         // Initialise to yesterday so the first scan of a new day always fires.
         let mut last_snapshot_date = String::new();
 
-        // Emit an immediate status before the first 90-second scan so the UI
-        // shows "game found" / "no game" without waiting for the scan to finish.
+        // Emit an immediate status before the first scan so the UI shows cached
+        // inventory data without waiting for the scan to finish.
         {
             let game_found = memory_scanner::find_warframe_pid_pub().is_some();
             let now_pre = chrono::Utc::now().timestamp();
+            let mut initial_qty = known.clone();
+            for k in unique_stable.keys() { initial_qty.entry(k.clone()).or_insert(1); }
             let _ = app.emit("inventory-update", InventoryUpdate {
-                quantities: known.clone(),
+                quantities: initial_qty,
                 crafting: vec![],
-                mastery_rank: None,
-                mastery_data: HashMap::new(),
+                mastery_rank: startup_cache.mastery_rank,
+                mastery_data: startup_cache.mastery_data.clone(),
                 changes: vec![],
-                consumed_suits: vec![],
+                consumed_suits: startup_cache.consumed_suits.clone(),
+                mods: known_mods.clone(),
                 warframe_running: game_found,
                 scanned_at: now_pre,
             });
@@ -3098,17 +3141,33 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
         if !inventory_hints.is_empty() {
             eprintln!("[monitor] loaded {} inventory hint(s) from disk", inventory_hints.len());
         }
+        // Blob logging: once per full pass when blob_log_enabled is true.
+        let mut blob_saved_this_pass = false;
+
         // Accumulated data for the current full pass (reset when resume_addr wraps to 0).
+        // mastery_data and consumed_suits are pre-seeded from cache — they don't change often
+        // and the scanner will overwrite with fresh data once it finds them.
         let mut pass_log_lines: Vec<String> = Vec::new();
         let mut pass_regions:   usize = 0;
-        let mut pass_mastery_rank: Option<u32> = None;
-        let mut pass_mastery_data: HashMap<String, u32> = HashMap::new();
+        let mut pass_mastery_rank: Option<u32> = startup_cache.mastery_rank;
+        let mut pass_mastery_data: HashMap<String, u32> = startup_cache.mastery_data;
         let mut pass_recipes: Vec<memory_scanner::PendingRecipe> = Vec::new();
         let mut pass_unique_seen: HashMap<String, ()> = HashMap::new();
         // Consumed suits persist across passes — subsumption is permanent, never un-subsumed.
-        let mut pass_consumed_suits: Vec<String> = Vec::new();
+        let mut pass_consumed_suits: Vec<String> = startup_cache.consumed_suits;
 
         while flag.load(Ordering::SeqCst) {
+            // If the user cleared the cache, shared_quantities will be empty while our
+            // local `known` still has the old data. Mirror that reset so the next scan
+            // records every item as a fresh gain (with change log entries) instead of
+            // silently re-emitting the stale quantities without any delta.
+            {
+                let sq = shared_quantities.lock().unwrap_or_else(|e| e.into_inner());
+                if sq.is_empty() && !known.is_empty() {
+                    known.clear();
+                }
+            }
+
             // 15-second window — small enough to find inventory quickly,
             // large enough to cover meaningful memory without thrashing.
             let result = memory_scanner::scan_warframe_memory(
@@ -3146,14 +3205,19 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                 // fast-path VirtualQuery check, and may still be valid when game restarts.
                 resume_addr = 0;
                 pass_log_lines.clear(); pass_regions = 0;
-                pass_mastery_rank = None; pass_mastery_data.clear();
+                // Keep mastery/mods/unique_stable/consumed_suits so the cached inventory
+                // stays visible in the UI while Warframe is not running. unique_stable will
+                // be properly pruned by retain() on the first full pass after relaunch.
                 pass_recipes.clear(); pass_unique_seen.clear();
-                unique_stable.clear();
+                let mut emit_qty = known.clone();
+                for k in unique_stable.keys() { emit_qty.entry(k.clone()).or_insert(1); }
                 let _ = app.emit("inventory-update", InventoryUpdate {
-                    quantities: known.clone(), crafting: vec![],
-                    mastery_rank: None, mastery_data: HashMap::new(),
+                    quantities: emit_qty, crafting: vec![],
+                    mastery_rank: pass_mastery_rank,
+                    mastery_data: pass_mastery_data.clone(),
                     changes: vec![], warframe_running: false, scanned_at: now,
-                    consumed_suits: vec![],
+                    consumed_suits: pass_consumed_suits.clone(),
+                    mods: known_mods.clone(),
                 });
                 std::thread::sleep(std::time::Duration::from_secs(5));
                 continue;
@@ -3184,6 +3248,7 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
             }
 
             // Commit resource changes immediately — no stability buffer.
+            let known_was_populated = !known.is_empty();
             let mut changes: Vec<QuantityChange> = Vec::new();
             for item in &result.items_found {
                 if !item.explicit_count { continue; }
@@ -3210,11 +3275,66 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                 changes.push(change);
             }
 
+            // If clear_cache fired during this scan window, shared_quantities will be empty
+            // while known still holds stale data. Reset known and skip the emit so the next
+            // window starts fresh and records every item as a 0→N gain in the change log.
+            // Use known_was_populated (captured before the change-detection loop) so this
+            // check never fires on the very first scan when known starts empty and sq is also
+            // empty (no cache file) — that would permanently prevent the first emit.
+            {
+                let sq = shared_quantities.lock().unwrap_or_else(|e| e.into_inner());
+                if sq.is_empty() && known_was_populated {
+                    drop(sq);
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+                        let _ = writeln!(f, "  [CACHE-CLEAR] shared_quantities emptied during scan — resetting known and skipping emit");
+                    }
+                    known.clear();
+                    unique_stable.clear();
+                    known_mods.clear();
+                    prev_mod_totals.clear();
+                    resume_addr = 0;
+                    continue;
+                }
+            }
+
+            // Mod stability buffer: confirm a count only when the same total appears twice.
+            // Anchoring to has_misc_root chunks already prevents most flipping; this catches
+            // any remaining oscillation between the live inventory and an old heap chunk.
+            let mut mods_changed = false;
+            if !result.mods_found.is_empty() {
+                for (path, mc) in &result.mods_found {
+                    let prev = prev_mod_totals.get(path).copied().unwrap_or(-1);
+                    if mc.total == prev {
+                        // Stable — commit to known_mods
+                        if known_mods.get(path).map(|e| e.total) != Some(mc.total) {
+                            mods_changed = true;
+                        }
+                        known_mods.insert(path.clone(), mc.clone());
+                    }
+                    prev_mod_totals.insert(path.clone(), mc.total);
+                }
+                if let Ok(mut sm) = shared_mods.lock() { *sm = known_mods.clone(); }
+            }
+
             // Emit immediately when this window found items or changes.
-            if !result.items_found.is_empty() || !changes.is_empty() {
-                if let Ok(mut q) = shared_quantities.lock() { *q = known.clone(); }
-                if let Ok(json) = serde_json::to_string(&known) {
-                    let _ = std::fs::write(&quantities_cache_path, json);
+            if !result.items_found.is_empty() || !changes.is_empty() || mods_changed {
+                if !result.items_found.is_empty() || !changes.is_empty() {
+                    if let Ok(mut q) = shared_quantities.lock() { *q = known.clone(); }
+                    // Persist full inventory state so all data survives restarts.
+                    let sc = InventoryStateCache {
+                        quantities: known.clone(),
+                        unique_items: unique_stable.iter()
+                            .filter(|(_, &c)| c >= 1)
+                            .map(|(k, _)| (k.clone(), 1i64))
+                            .collect(),
+                        mods: known_mods.iter().map(|(k, v)| (k.clone(), CachedModCount::from(v))).collect(),
+                        mastery_rank: pass_mastery_rank,
+                        mastery_data: pass_mastery_data.clone(),
+                        consumed_suits: pass_consumed_suits.clone(),
+                    };
+                    if let Ok(json) = serde_json::to_string(&sc) {
+                        let _ = std::fs::write(&inventory_state_cache_path, json);
+                    }
                 }
                 let crafting: Vec<CraftingJob> = pass_recipes.iter().map(|r| {
                     let name = display_names.iter().zip(unique_names.iter())
@@ -3234,6 +3354,7 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                     mastery_data: pass_mastery_data.clone(),
                     changes, warframe_running: true, scanned_at: now,
                     consumed_suits: pass_consumed_suits.clone(),
+                    mods: known_mods.clone(),
                 });
             }
 
@@ -3245,29 +3366,66 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                 if let Ok(json) = serde_json::to_string(&inventory_hints.iter().map(|&a| a as u64).collect::<Vec<_>>()) {
                     let _ = std::fs::write(&hints_path, json);
                 }
+                // Auto-capture: save a timestamped blob once per full pass when enabled.
+                if !blob_saved_this_pass && blob_log_enabled.load(Ordering::SeqCst) {
+                    blob_saved_this_pass = true;
+                    let ts = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
+                    let blob_path = blob_log_dir.join(format!("inventory_{}.txt", ts));
+                    match memory_scanner::capture_inventory_blob(&blob_path) {
+                        Ok(msg)  => eprintln!("[monitor] blob saved: {}", msg),
+                        Err(e)   => eprintln!("[monitor] blob save failed: {}", e),
+                    }
+                }
+            } else if !inventory_hints.is_empty() && result.warframe_running {
+                // Had hints but hot path found nothing — inventory heap moved (common after
+                // returning from a mission). Force a full rescan from address 0 so the new
+                // location is found within the next 1–2 windows instead of waiting for the
+                // rolling scan to naturally wrap around (which can take 5–10 minutes).
+                eprintln!("[monitor] inventory hints lost — resetting scan to addr 0");
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+                    let _ = writeln!(f, "  [HINT-RESET] stale hints cleared — full rescan from addr 0");
+                }
+                inventory_hints.clear();
+                let _ = std::fs::remove_file(&hints_path);
+                resume_addr = 0;
             }
 
             // Full pass completed (scanner wrapped back to start of address space).
             if resume_addr == 0 {
                 // Update unique_stable from items seen this full pass.
                 for name in pass_unique_seen.keys() {
-                    if name.starts_with("/Lotus/Powersuits/")
-                        || name.starts_with("/Lotus/Types/Sentinels/SentinelPowersuits/")
-                    {
-                        let e = unique_stable.entry(name.clone()).or_insert(0u8);
-                        if *e < 2 { *e += 1; }
-                    }
+                    let e = unique_stable.entry(name.clone()).or_insert(0u8);
+                    if *e < 2 { *e += 1; }
                 }
                 unique_stable.retain(|k, _| pass_unique_seen.contains_key(k));
                 if let Ok(mut uq) = shared_unique.lock() {
                     uq.clear();
                     for (name, &count) in &unique_stable {
-                        if count >= 2 { uq.insert(name.clone(), 1); }
+                        if count >= 1 { uq.insert(name.clone(), 1); }
+                    }
+                }
+
+                // Write full state cache after every complete pass — unique items are now
+                // fully evaluated (stability buffer settled), so this is the authoritative snapshot.
+                {
+                    let sc = InventoryStateCache {
+                        quantities: known.clone(),
+                        unique_items: unique_stable.iter()
+                            .filter(|(_, &c)| c >= 1)
+                            .map(|(k, _)| (k.clone(), 1i64))
+                            .collect(),
+                        mods: known_mods.iter().map(|(k, v)| (k.clone(), CachedModCount::from(v))).collect(),
+                        mastery_rank: pass_mastery_rank,
+                        mastery_data: pass_mastery_data.clone(),
+                        consumed_suits: pass_consumed_suits.clone(),
+                    };
+                    if let Ok(json) = serde_json::to_string(&sc) {
+                        let _ = std::fs::write(&inventory_state_cache_path, json);
                     }
                 }
 
                 // Full pass done — truncate log so the next pass starts fresh,
-                // then write a summary header so the user can see pass boundaries.
+                // then write a summary header + stability buffer state.
                 let now_str = chrono::DateTime::from_timestamp(now, 0)
                     .map(|dt: chrono::DateTime<chrono::Utc>| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
                     .unwrap_or_else(|| now.to_string());
@@ -3275,6 +3433,20 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                     Ok(mut f) => {
                         let _ = writeln!(f, "=== Full pass complete at {} (regions={} known_items={}) ===",
                             now_str, pass_regions, known.len());
+                        // Stability buffer: show every unique item and its confirmation count.
+                        // count=1 means seen once (needs one more pass), count=2 means confirmed+emitted.
+                        let mut stable_entries: Vec<(&String, &u8)> = unique_stable.iter().collect();
+                        stable_entries.sort_by_key(|(k, _)| k.as_str());
+                        for (name, count) in &stable_entries {
+                            let tail = name.split('/').filter(|s| !s.is_empty())
+                                .collect::<Vec<_>>().iter().rev().take(2).rev()
+                                .cloned().collect::<Vec<_>>().join("/");
+                            let status = if **count >= 2 { "CONFIRMED" } else { "pending(1/2)" };
+                            let _ = writeln!(f, "  [stable] {}/{}  {}  {}", count, 2, tail, status);
+                        }
+                        if stable_entries.is_empty() {
+                            let _ = writeln!(f, "  [stable] (empty — no unique items seen this pass)");
+                        }
                     }
                     Err(e) => eprintln!("[monitor] log open failed: {}", e),
                 }
@@ -3296,6 +3468,7 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                 pass_regions = 0;
                 pass_unique_seen.clear();
                 pass_recipes.clear();
+                blob_saved_this_pass = false;
                 // pass_consumed_suits intentionally NOT cleared — subsumption is permanent.
                 // Keep mastery data — it doesn't change often.
             }
@@ -5040,6 +5213,53 @@ fn get_overlay_session_log() -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|_| "(no session log yet — trigger a Void Fissure first)".into())
 }
 
+/// Capture a diagnostic bundle: scan log + screenshot of the full Warframe window
+/// (including any overlay on top via GDI desktop BitBlt / DXGI fallback).
+/// Saves everything to %TEMP%\warframe-companion\diagnostics\<timestamp>\ and
+/// returns the folder path so the frontend can show it.
+#[tauri::command]
+fn capture_diagnostics(state: State<'_, AppState>) -> Result<String, String> {
+    let ts = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
+    let folder = std::env::temp_dir()
+        .join("warframe-companion")
+        .join("diagnostics")
+        .join(&ts);
+    std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
+
+    // Copy the scanner log
+    if state.log_path.exists() {
+        let _ = std::fs::copy(&state.log_path, folder.join("scan_log.txt"));
+    }
+    // Copy the change log
+    if state.changes_log_path.exists() {
+        let _ = std::fs::copy(&state.changes_log_path, folder.join("changes_log.txt"));
+    }
+
+    // Screenshot
+    match ocr::capture_screen_for_diagnostics() {
+        Ok((pixels_bgra, w, h)) => {
+            // BGRA → RGBA for PNG encoding
+            let mut rgba = Vec::with_capacity(pixels_bgra.len());
+            for p in pixels_bgra.chunks_exact(4) {
+                rgba.extend_from_slice(&[p[2], p[1], p[0], p[3]]);
+            }
+            let png_path = folder.join("screenshot.png");
+            let file = std::fs::File::create(&png_path).map_err(|e| e.to_string())?;
+            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header()
+                .and_then(|mut wr| wr.write_image_data(&rgba))
+                .map_err(|e| e.to_string())?;
+        }
+        Err(e) => {
+            let _ = std::fs::write(folder.join("screenshot_error.txt"), &e);
+        }
+    }
+
+    Ok(folder.to_string_lossy().into_owned())
+}
+
 /// Returns the Warframe game CLIENT AREA as [x, y, width, height] in screen pixels.
 /// Uses GetClientRect + ClientToScreen so the rect matches what the OCR captures —
 /// both exclude the window title bar and borders in windowed mode.
@@ -5125,10 +5345,88 @@ fn load_items_cache(path: &PathBuf) -> Option<Vec<WfcdItem>> {
         let mastery_req = v["mastery_req"].as_u64().map(|n| n as u32);
         Some(WfcdItem { unique_name, name, category, image_name, vaulted, ducats, mastery_req })
     }).collect();
-    if items.is_empty() { None } else { Some(items) }
+    if items.is_empty() { None } else { Some(dedup_known_aliases(items)) }
+}
+
+/// Remove known duplicate entries caused by the game listing the same warframe under
+/// two name orderings (e.g. "Orion & Sirius" vs "Sirius & Orion").
+/// Extend this list whenever DE adds another dual-character warframe with swapped names.
+fn dedup_known_aliases(mut items: Vec<WfcdItem>) -> Vec<WfcdItem> {
+    // Each tuple: (alias to drop, canonical name to keep)
+    const ALIASES: &[(&str, &str)] = &[
+        ("Orion & Sirius", "Sirius & Orion"),
+    ];
+    for (alias, canonical) in ALIASES {
+        let has_canonical = items.iter().any(|i| i.name == *canonical);
+        if has_canonical {
+            items.retain(|i| &i.name.as_str() != alias);
+        }
+    }
+    items
 }
 
 fn load_quantities_cache(path: &PathBuf) -> HashMap<String, i64> {
+    std::fs::read_to_string(path).ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Full inventory snapshot persisted to disk. Survives app restarts.
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+struct InventoryStateCache {
+    /// Stackable resources: unique_name → quantity
+    #[serde(default)]
+    quantities: HashMap<String, i64>,
+    /// Owned unique items (warframes, weapons, companions, archwings): unique_name → 1
+    #[serde(default)]
+    unique_items: HashMap<String, i64>,
+    /// Mod/arcane inventory: unique_name → {total, by_rank}.
+    /// by_rank uses String keys ("0", "1", ...) to avoid HashMap<u8,_> deserialisation,
+    /// which triggers a serde_json/serde_core symbol-resolution bug in serde ≥1.0.228.
+    #[serde(default)]
+    mods: HashMap<String, CachedModCount>,
+    /// Player mastery rank
+    #[serde(default)]
+    mastery_rank: Option<u32>,
+    /// Per-item mastery XP/rank: unique_name → rank
+    #[serde(default)]
+    mastery_data: HashMap<String, u32>,
+    /// Helminth-subsumed warframe paths
+    #[serde(default)]
+    consumed_suits: Vec<String>,
+}
+
+/// Like `memory_scanner::ModCount` but `by_rank` uses `String` keys so serde_json
+/// does not need to call `deserialize_any` on a JSON number (avoiding a linker error
+/// with serde_core ≥1.0.228).
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+struct CachedModCount {
+    total: i64,
+    #[serde(default)]
+    by_rank: HashMap<String, i64>,
+}
+
+impl From<&memory_scanner::ModCount> for CachedModCount {
+    fn from(mc: &memory_scanner::ModCount) -> Self {
+        CachedModCount {
+            total: mc.total,
+            by_rank: mc.by_rank.iter().map(|(&k, &v)| (k.to_string(), v)).collect(),
+        }
+    }
+}
+
+impl From<&CachedModCount> for memory_scanner::ModCount {
+    fn from(cmc: &CachedModCount) -> Self {
+        memory_scanner::ModCount {
+            total: cmc.total,
+            by_rank: cmc.by_rank.iter()
+                .filter_map(|(k, &v)| k.parse::<u8>().ok().map(|r| (r, v)))
+                .collect(),
+        }
+    }
+}
+
+fn load_inventory_state_cache(path: &PathBuf) -> InventoryStateCache {
     std::fs::read_to_string(path).ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
@@ -5233,10 +5531,13 @@ pub fn run() {
     let relic_drops_cache_path = data_dir.join("relic_drops_cache.json");
     let relic_rewards_cache_path = data_dir.join("relic_rewards_cache.json");
     let quantities_cache_path = data_dir.join("quantities_cache.json");
+    let inventory_state_cache_path = data_dir.join("inventory_state_cache.json");
     let settings_path = data_dir.join("settings.json");
     let log_path = data_dir.join("scan_log.txt");
     let changes_log_path = data_dir.join("inventory_changes.txt");
     let raw_scan_path = data_dir.join("raw_scan.txt");
+    let blob_log_dir = data_dir.join("blobs");
+    let _ = std::fs::create_dir_all(&blob_log_dir);
     let wfm_top_cache_path = data_dir.join("wfm_top_cache.json");
     let syndicate_catalog_path = data_dir.join("syndicate_catalog.json");
 
@@ -5249,7 +5550,14 @@ pub fn run() {
         .ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
     let initial_relic_rewards: HashMap<String, Vec<wfcd::RelicReward>> = std::fs::read_to_string(&relic_rewards_cache_path)
         .ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-    let initial_quantities = load_quantities_cache(&quantities_cache_path);
+    // Load unified inventory state cache (quantities + unique items + mods + mastery + consumed suits).
+    // Falls back to the old quantities_cache.json for resources if the new file is missing.
+    let initial_state = load_inventory_state_cache(&inventory_state_cache_path);
+    let initial_quantities = if !initial_state.quantities.is_empty() {
+        initial_state.quantities.clone()
+    } else {
+        load_quantities_cache(&quantities_cache_path)
+    };
     let initial_syndicate_catalog: HashMap<String, Vec<SyndicateOffer>> = std::fs::read_to_string(&syndicate_catalog_path)
         .ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
 
@@ -5262,6 +5570,7 @@ pub fn run() {
             relic_drops_cache_path,
             relic_rewards_cache_path,
             quantities_cache_path,
+            inventory_state_cache_path,
             settings_path,
             log_path,
             changes_log_path,
@@ -5273,11 +5582,18 @@ pub fn run() {
             blueprint_to_result: Mutex::new(HashMap::new()),
             wiki_reward_names: Mutex::new(std::collections::HashSet::new()),
             current_quantities: Arc::new(Mutex::new(initial_quantities)),
-            unique_quantities: Arc::new(Mutex::new(HashMap::new())),
+            unique_quantities: Arc::new(Mutex::new(initial_state.unique_items)),
+            current_mods: Arc::new(Mutex::new(
+                initial_state.mods.iter()
+                    .map(|(k, v)| (k.clone(), memory_scanner::ModCount::from(v)))
+                    .collect()
+            )),
             current_crafting: Arc::new(Mutex::new(vec![])),
             monitor_active: Arc::new(AtomicBool::new(false)),
             raw_scan_active: Arc::new(AtomicBool::new(false)),
             raw_scan_path,
+            blob_log_enabled: Arc::new(AtomicBool::new(false)),
+            blob_log_dir,
             wfm_price_cache: Mutex::new(HashMap::new()),
             wfm_session: Arc::new(Mutex::new(None)),
             wfm_top_cache_path,
@@ -5320,6 +5636,8 @@ pub fn run() {
             log_api_changes,
             dump_memory_probe,
             toggle_raw_scan,
+            capture_inventory_blob,
+            set_blob_log,
             get_app_version,
             set_app_version,
             get_craftable_items,
@@ -5374,6 +5692,7 @@ pub fn run() {
             fetch_worldstate,
             get_warframe_window_rect,
             get_overlay_session_log,
+            capture_diagnostics,
             start_monitor,
             stop_monitor,
             get_monitor_status,

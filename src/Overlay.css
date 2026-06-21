@@ -36,6 +36,10 @@ body { background: transparent !important; margin: 0; overflow: hidden; }
   display: flex; flex-direction: column; gap: 4px;
   box-shadow: 0 4px 16px rgba(0,0,0,0.55);
 }
+.ov-card-unknown {
+  border-color: rgba(180, 140, 60, 0.6);
+  background: rgba(30, 24, 14, 0.82);
+}
 
 /* ─── Item name ──────────────────────────────────────────────────────────── */
 .ov-name {

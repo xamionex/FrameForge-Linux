@@ -18,26 +18,59 @@ fn avg_brightness(pixels: &[u8]) -> u32 {
     sum / (pixels.len() / 4 / 64).max(1) as u32
 }
 
+/// Strip this fraction of the full window height from the top before OCR.
+/// Removes HUD overlays (FPS counters, ping displays, Nvidia/AMD overlays).
+const OCR_SKIP_TOP_FRAC: f32 = 0.10;
+
+/// Strip this fraction of the full window height from the bottom before OCR.
+/// Removes objective trackers, chat, ability bars, and other bottom-HUD elements.
+const OCR_SKIP_BOTTOM_FRAC: f32 = 0.10;
+
+/// Crop the top N rows off a pixel buffer. Returns (cropped_pixels, new_cap_h).
+fn crop_top_strip(pixels: Vec<u8>, w: u32, cap_h: u32, full_h: u32, skip_frac: f32) -> (Vec<u8>, u32) {
+    let skip_rows = ((full_h as f32 * skip_frac) as u32).min(cap_h.saturating_sub(1));
+    let skip_bytes = (skip_rows * w * 4) as usize;
+    if skip_bytes == 0 || skip_bytes >= pixels.len() {
+        return (pixels, cap_h);
+    }
+    (pixels[skip_bytes..].to_vec(), cap_h - skip_rows)
+}
+
+/// Crop the bottom N rows off a pixel buffer. Returns (cropped_pixels, new_cap_h).
+fn crop_bottom_strip(pixels: Vec<u8>, w: u32, cap_h: u32, full_h: u32, skip_frac: f32) -> (Vec<u8>, u32) {
+    let drop_rows = ((full_h as f32 * skip_frac) as u32).min(cap_h.saturating_sub(1));
+    let keep_rows = cap_h.saturating_sub(drop_rows);
+    if keep_rows == 0 || keep_rows == cap_h {
+        return (pixels, cap_h);
+    }
+    let keep_bytes = (keep_rows * w * 4) as usize;
+    (pixels[..keep_bytes.min(pixels.len())].to_vec(), keep_rows)
+}
+
 /// Main entry point. Tries PrintWindow first, falls back to DXGI if the frame is dark.
 /// Returns (BGRA pixels, width, captured_height, full_height, capture_info).
+/// captured_height covers y=[10%, 38%] of the full window — top and bottom 10% are
+/// stripped to exclude HUD overlays (FPS/ping counters, ability bars, chat) from OCR.
 /// capture_info describes which path was used and the pixel brightness, for session logging.
 #[cfg(target_os = "windows")]
 pub fn capture_warframe_reward_area() -> Option<(Vec<u8>, u32, u32, u32, String)> {
     // ── Path A: PrintWindow (Windowed / Borderless Windowed) ──────────────────
     if let Some((pixels, w, cap_h, full_h)) = capture_printwindow() {
+        let (pixels, cap_h) = crop_top_strip(pixels, w, cap_h, full_h, OCR_SKIP_TOP_FRAC);
+        let (pixels, cap_h) = crop_bottom_strip(pixels, w, cap_h, full_h, OCR_SKIP_BOTTOM_FRAC);
         let avg = avg_brightness(&pixels);
         if avg >= 20 {
-            let info = format!("PrintWindow  {}×{}px (cap {}px)  avg_brightness={}", w, full_h, cap_h, avg);
+            let info = format!("PrintWindow  {}×{}px (skip 10%/10%, cap {}px)  avg_brightness={}", w, full_h, cap_h, avg);
             return Some((pixels, w, cap_h, full_h, info));
         }
         // Dark frame — Fullscreen Exclusive likely. Fall through to DXGI.
-        // (The dark-frame detection in extract_reward_items_twophase will still log this
-        //  if DXGI also fails, but normally DXGI succeeds where PrintWindow returns black.)
-        let _ = avg; // avg already computed, used only for logging below if DXGI also tried
-        if let Some((px2, w2, cap_h2, full_h2)) = capture_dxgi() {
+        let _ = avg;
+        if let Some((px2, w2, cap_h2, full_h2)) = capture_dxgi(0.48) {
+            let (px2, cap_h2) = crop_top_strip(px2, w2, cap_h2, full_h2, OCR_SKIP_TOP_FRAC);
+            let (px2, cap_h2) = crop_bottom_strip(px2, w2, cap_h2, full_h2, OCR_SKIP_BOTTOM_FRAC);
             let avg2 = avg_brightness(&px2);
             let info = format!(
-                "DXGI  {}×{}px (cap {}px)  avg_brightness={} \
+                "DXGI  {}×{}px (skip 10%/10%, cap {}px)  avg_brightness={} \
                  (PrintWindow was dark: avg={})",
                 w2, full_h2, cap_h2, avg2, avg
             );
@@ -46,17 +79,19 @@ pub fn capture_warframe_reward_area() -> Option<(Vec<u8>, u32, u32, u32, String)
         // Both paths failed — return the dark PrintWindow result so the caller
         // can classify it as dark-frame and log it properly.
         let info = format!(
-            "PrintWindow  {}×{}px (cap {}px)  avg_brightness={} [DARK — DXGI also failed]",
+            "PrintWindow  {}×{}px (skip 10%/10%, cap {}px)  avg_brightness={} [DARK — DXGI also failed]",
             w, full_h, cap_h, avg
         );
         return Some((pixels, w, cap_h, full_h, info));
     }
 
     // PrintWindow found no window (Warframe not running?) — try DXGI anyway
-    if let Some((pixels, w, cap_h, full_h)) = capture_dxgi() {
+    if let Some((pixels, w, cap_h, full_h)) = capture_dxgi(0.48) {
+        let (pixels, cap_h) = crop_top_strip(pixels, w, cap_h, full_h, OCR_SKIP_TOP_FRAC);
+        let (pixels, cap_h) = crop_bottom_strip(pixels, w, cap_h, full_h, OCR_SKIP_BOTTOM_FRAC);
         let avg = avg_brightness(&pixels);
         let info = format!(
-            "DXGI  {}×{}px (cap {}px)  avg_brightness={} (no Warframe window found)",
+            "DXGI  {}×{}px (skip 10%/10%, cap {}px)  avg_brightness={} (no Warframe window found)",
             w, full_h, cap_h, avg
         );
         return Some((pixels, w, cap_h, full_h, info));
@@ -280,13 +315,91 @@ pub fn capture_rect_and_ocr(x_start: f32, x_end: f32, y_start: f32, y_end: f32) 
     ocr_pixels_rect(&pixels, w, h, x_start, x_end, y_start, y_end)
 }
 
+/// Captures the full Warframe window region from the desktop using GDI BitBlt.
+/// Because this reads the composited desktop surface (not the window in isolation),
+/// any Tauri overlay window sitting on top is included in the result.
+/// Falls back to full-monitor DXGI if the frame is dark (fullscreen exclusive mode).
+/// Returns BGRA pixels, width, height.
+#[cfg(target_os = "windows")]
+pub fn capture_screen_for_diagnostics() -> Result<(Vec<u8>, u32, u32), String> {
+    if let Some((pixels, w, h)) = capture_screen_gdi() {
+        if avg_brightness(&pixels) >= 10 {
+            return Ok((pixels, w, h));
+        }
+    }
+    // Dark — fullscreen exclusive. Fall back to full-height DXGI.
+    match capture_dxgi(1.0) {
+        Some((pixels, w, _cap_h, full_h)) => Ok((pixels, w, full_h)),
+        None => Err("Warframe window not found or capture failed".into()),
+    }
+}
+
+/// GDI BitBlt from the desktop DC covering the Warframe window's screen rectangle.
+/// DWM composites all windows before BitBlt reads them, so overlay windows appear.
+#[cfg(target_os = "windows")]
+fn capture_screen_gdi() -> Option<(Vec<u8>, u32, u32)> {
+    use std::mem;
+    use windows_sys::Win32::{
+        Foundation::RECT,
+        Graphics::Gdi::{
+            BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
+            GetDC, GetDIBits, ReleaseDC, SelectObject,
+            BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, RGBQUAD,
+            SRCCOPY,
+        },
+        UI::WindowsAndMessaging::{FindWindowW, GetWindowRect},
+    };
+    unsafe {
+        let title: Vec<u16> = "Warframe\0".encode_utf16().collect();
+        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        if hwnd == 0 { return None; }
+
+        let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        GetWindowRect(hwnd, &mut rect);
+        let w = (rect.right  - rect.left) as u32;
+        let h = (rect.bottom - rect.top)  as u32;
+        if w < 100 || h < 100 { return None; }
+
+        let hdc_screen = GetDC(0);
+        let hdc_mem    = CreateCompatibleDC(hdc_screen);
+        let hbm        = CreateCompatibleBitmap(hdc_screen, w as i32, h as i32);
+        let hbm_old    = SelectObject(hdc_mem, hbm);
+
+        BitBlt(hdc_mem, 0, 0, w as i32, h as i32,
+               hdc_screen, rect.left, rect.top, SRCCOPY);
+
+        let mut bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize:          mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth:         w as i32,
+                biHeight:        -(h as i32), // negative = top-down row order
+                biPlanes:        1,
+                biBitCount:      32,
+                biCompression:   BI_RGB,
+                biSizeImage:     0, biXPelsPerMeter: 0, biYPelsPerMeter: 0,
+                biClrUsed:       0, biClrImportant:  0,
+            },
+            bmiColors: [RGBQUAD { rgbBlue: 0, rgbGreen: 0, rgbRed: 0, rgbReserved: 0 }],
+        };
+        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        GetDIBits(hdc_mem, hbm, 0, h,
+                  pixels.as_mut_ptr() as *mut _, &mut bmi, DIB_RGB_COLORS);
+
+        SelectObject(hdc_mem, hbm_old);
+        DeleteObject(hbm);
+        DeleteDC(hdc_mem);
+        ReleaseDC(0, hdc_screen);
+        Some((pixels, w, h))
+    }
+}
+
 /// DXGI Desktop Duplication capture — works for Fullscreen Exclusive (and all other modes).
 ///
 /// Dynamically determines which monitor the Warframe window is on so this works correctly
 /// for any number of monitors, any primary/secondary arrangement, and any resolution.
 /// Falls back to the primary monitor if the Warframe window can't be found.
 #[cfg(target_os = "windows")]
-fn capture_dxgi() -> Option<(Vec<u8>, u32, u32, u32)> {
+fn capture_dxgi(cap_frac: f32) -> Option<(Vec<u8>, u32, u32, u32)> {
     use windows::core::Interface; // required for .cast() on COM types
     use windows::Win32::Graphics::{
         Direct3D::D3D_DRIVER_TYPE_HARDWARE,
@@ -383,7 +496,7 @@ fn capture_dxgi() -> Option<(Vec<u8>, u32, u32, u32)> {
                     let _ = dupl.ReleaseFrame(); continue;
                 }
 
-                let cap_h     = (full_h as f32 * 0.48) as u32;
+                let cap_h     = ((full_h as f32 * cap_frac) as u32).max(1);
                 let row_pitch = mapped.RowPitch as usize;
                 let src_ptr   = mapped.pData as *const u8;
 
@@ -1381,7 +1494,21 @@ pub fn extract_reward_items_twophase(
         // score exactly 0.667 (still rejected). A specific word matched via suffix
         // or Levenshtein + one generic word scores ≥0.69 and is now accepted,
         // preventing the fallback which can cross-contaminate words from other columns.
-        if best_score < 0.67 { continue; }
+        if best_score < 0.67 {
+            // Unknown item (WFCD not yet updated or OCR garbled).
+            // Emit raw OCR text with a "?:" prefix so the overlay can still show something.
+            let raw = col_texts.iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !raw.is_empty() {
+                items.push(format!("?:{}", raw));
+                positions.push(*cx);
+            }
+            continue;
+        }
         let unique = match best_unique { Some(u) => u, None => continue };
         // No dedup here — each column is a distinct physical card.
         // Two players cracking the same relic legitimately show the same reward twice.
@@ -1410,7 +1537,6 @@ pub fn extract_reward_items_twophase(
     if items.len() < estimated_cards {
         let all_words = build_word_set(
             &ocr_lines.iter()
-                .filter(|(_, _, y)| *y >= 0.10)
                 .map(|(t, _, _)| t.clone())
                 .collect::<Vec<_>>()
         );

@@ -1,5 +1,13 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct ModCount {
+    /// Total copies owned (all ranks combined)
+    pub total: i64,
+    /// rank (0 = unranked) → count at that rank
+    pub by_rank: HashMap<u8, i64>,
+}
 
 #[derive(Debug, Serialize, Clone)]
 pub struct FoundItem {
@@ -47,6 +55,9 @@ pub struct ScanResult {
     pub hot_addrs: Vec<usize>,
     /// Warframe unique-name paths found in InfestedFoundry.ConsumedSuits (Helminth subsumed).
     pub consumed_suits: Vec<String>,
+    /// Mod/arcane counts from RawUpgrades: unique_name → {total, by_rank}.
+    /// Only populated for chunks that contain the inventory root (MiscItems anchor).
+    pub mods_found: HashMap<String, ModCount>,
 }
 
 // ─── Shared helpers ───────────────────────────────────────────────────────────
@@ -157,6 +168,18 @@ fn scan_inventory_resources(data: &[u8], unique_paths: &std::collections::HashSe
         if unique_paths.contains(&path) { pos = count_pos + 1; continue; }
         if path.starts_with("/Lotus/Upgrades/") { pos = count_pos + 1; continue; }
 
+        // Reject Nightwave/store price entries. Store JSON looks like:
+        //   "ItemPrices":[{"ItemCount":25,"ItemType":"/Lotus/...","ProductCategory":"MiscItems"}]
+        // Inventory items never have "ProductCategory" after the path — skip if found within 20 bytes.
+        {
+            let after = path_end + 1;
+            let window = data.get(after..after + 20).unwrap_or(&data[after.min(data.len())..]);
+            if window.windows(b"\"ProductCategory\"".len()).any(|w| w == b"\"ProductCategory\"") {
+                pos = count_pos + 1;
+                continue;
+            }
+        }
+
         // Reject stale heap allocations: live inventory JSON is pure printable ASCII,
         // but freed/reused allocations have binary garbage before the fragment.
         if !has_clean_prefix(data, count_pos, 300) { pos = count_pos + 1; continue; }
@@ -185,13 +208,14 @@ fn scan_inventory_resources(data: &[u8], unique_paths: &std::collections::HashSe
 // backwards with brace-depth tracking to locate ItemCount in the same object.
 // Entries with a single copy omit ItemCount entirely (implicit qty = 1).
 
-fn scan_inventory_mods(data: &[u8]) -> Vec<(String, i64, String)> {
+fn scan_inventory_mods(data: &[u8]) -> Vec<(String, ModCount, String)> {
     const RAW_KEY:   &[u8] = b"\"RawUpgrades\":[";
     const TYPE_KEY:  &[u8] = b"\"ItemType\":\"";
     const COUNT_KEY: &[u8] = b"\"ItemCount\":";
+    const LEVEL_KEY: &[u8] = b"\"ItemLevel\":";
     const MOD_PFX:   &[u8] = b"/Lotus/Upgrades/";
 
-    let mut results: HashMap<String, (i64, String)> = HashMap::new();
+    let mut results: HashMap<String, (ModCount, String)> = HashMap::new();
     let mut outer = 0usize;
 
     const INV_CHANGES_KEY: &[u8] = b"\"InventoryChanges\"";
@@ -280,16 +304,48 @@ fn scan_inventory_mods(data: &[u8]) -> Vec<(String, i64, String)> {
                 qty_val
             };
 
+            // Extract ItemLevel (rank) — appears after ItemType in the JSON entry.
+            // Search forward from path_end up to the entry's closing }.
+            let rank: u8 = {
+                let forward_start = path_end + 1;
+                let forward_end = (forward_start + 256).min(section.len());
+                let after = &section[forward_start..forward_end];
+                // Find the closing } of this entry at brace depth 0
+                let entry_close = {
+                    let mut depth = 0i32;
+                    let mut close = after.len();
+                    for (i, &b) in after.iter().enumerate() {
+                        match b {
+                            b'{' => depth += 1,
+                            b'}' => {
+                                if depth == 0 { close = i; break; }
+                                depth -= 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                    close
+                };
+                let entry_slice = &after[..entry_close];
+                if let Some(rel) = entry_slice.windows(LEVEL_KEY.len()).position(|w| w == LEVEL_KEY) {
+                    let num_start = forward_start + rel + LEVEL_KEY.len();
+                    parse_int(section, num_start).unwrap_or(0).min(255) as u8
+                } else {
+                    0
+                }
+            };
+
             // Accumulate — same path can appear multiple times (different rank copies)
             let entry = results.entry(path.clone()).or_insert_with(|| {
-                (0, extract_context(data, section_start + pos + type_rel, 300, 200))
+                (ModCount::default(), extract_context(data, section_start + pos + type_rel, 300, 200))
             });
-            entry.0 += qty;
+            entry.0.total += qty;
+            *entry.0.by_rank.entry(rank).or_insert(0) += qty;
             pos = path_end + 1;
         }
     }
 
-    results.into_iter().map(|(k, (q, c))| (k, q, c)).collect()
+    results.into_iter().map(|(k, (mc, c))| (k, mc, c)).collect()
 }
 
 // ─── Scanner 2: Unique items (warframes / weapons / companions) ───────────────
@@ -627,7 +683,7 @@ pub fn scan_warframe_memory(
         return ScanResult {
             warframe_running: false, items_found: vec![], pending_recipes: vec![], mastery_rank: None, mastery_data: HashMap::new(), regions_scanned: 0,
             error: Some("No item paths loaded. Click 'Refresh item list' first.".to_string()),
-            log_lines: vec![], relic_rewards: None, resume_addr: 0, hot_addrs: vec![], consumed_suits: vec![],
+            log_lines: vec![], relic_rewards: None, resume_addr: 0, hot_addrs: vec![], consumed_suits: vec![], mods_found: HashMap::new(),
         };
     }
 
@@ -675,7 +731,7 @@ pub fn scan_warframe_memory(
             Err(e) => return ScanResult {
                 warframe_running: false, items_found: vec![], pending_recipes: vec![], mastery_rank: None, mastery_data: HashMap::new(), regions_scanned: 0,
                 error: Some(format!("AC build error: {}", e)),
-                log_lines: vec![], relic_rewards: None, resume_addr: 0, hot_addrs: vec![], consumed_suits: vec![],
+                log_lines: vec![], relic_rewards: None, resume_addr: 0, hot_addrs: vec![], consumed_suits: vec![], mods_found: HashMap::new(),
             },
         }
     };
@@ -686,11 +742,12 @@ pub fn scan_warframe_memory(
             warframe_running: false, items_found: vec![], pending_recipes: vec![], mastery_rank: None, mastery_data: HashMap::new(), regions_scanned: 0,
             error: Some("Warframe is not running. Launch the game first.".to_string()),
             log_lines: vec!["[pid] find_warframe_pid returned None — process not found via ToolHelp snapshot".to_string()],
-            relic_rewards: None, resume_addr: 0, hot_addrs: vec![], consumed_suits: vec![],
+            relic_rewards: None, resume_addr: 0, hot_addrs: vec![], consumed_suits: vec![], mods_found: HashMap::new(),
         },
     };
 
     let mut resources:    HashMap<String, (i64, String)> = HashMap::new();
+    let mut mods:         HashMap<String, (ModCount, String)> = HashMap::new(); // path → (count+ranks, ctx)
     let mut unique:       HashMap<String, usize> = HashMap::new(); // path → best region hit-count
     let mut mastery_data: HashMap<String, u32>   = HashMap::new(); // path → max rank seen
     let mut pending_recipes: Vec<PendingRecipe>            = Vec::new();
@@ -717,7 +774,7 @@ pub fn scan_warframe_memory(
                 warframe_running: true, items_found: vec![], pending_recipes: vec![], mastery_rank: None, mastery_data: HashMap::new(), regions_scanned: 0,
                 error: Some(format!("Cannot open Warframe process (error {}). Run as Administrator.", err_code)),
                 log_lines: vec![format!("[pid] OpenProcess failed for pid={} error={}", pid, err_code)],
-                relic_rewards: None, resume_addr: 0, hot_addrs: vec![], consumed_suits: vec![],
+                relic_rewards: None, resume_addr: 0, hot_addrs: vec![], consumed_suits: vec![], mods_found: HashMap::new(),
             };
         }
 
@@ -759,7 +816,11 @@ pub fn scan_warframe_memory(
             let mod_pairs = scan_inventory_mods(data);
             if !mod_pairs.is_empty() {
                 log_lines.push(format!("  [hint-mods] count={}", mod_pairs.len()));
-                for (path, qty, ctx) in mod_pairs { resources.entry(path).or_insert((qty, ctx)); }
+                for (path, mc, ctx) in mod_pairs {
+                    // Use max-total: the section with more entries is more authoritative
+                    let entry = mods.entry(path).or_insert_with(|| (ModCount::default(), ctx.clone()));
+                    if mc.total > entry.0.total { entry.0 = mc; entry.1 = ctx; }
+                }
             }
             if mastery_rank.is_none() { mastery_rank = scan_mastery_rank(data); }
             if has_number_long_in(data) {
@@ -886,11 +947,16 @@ pub fn scan_warframe_memory(
                 }
 
                 // ── Scanner 1b: Mods / Arcanes ────────────────────────────────
-                let mod_pairs = scan_inventory_mods(data);
-                if !mod_pairs.is_empty() {
-                    log_lines.push(format!("  [mods] count={}", mod_pairs.len()));
-                    for (path, qty, ctx) in mod_pairs {
-                        resources.entry(path).or_insert((qty, ctx));
+                // Only scan for mods on chunks that contain the inventory root.
+                // RawUpgrades stale/delta blobs in other chunks cause count flipping.
+                if has_misc_root {
+                    let mod_pairs = scan_inventory_mods(data);
+                    if !mod_pairs.is_empty() {
+                        log_lines.push(format!("  [mods] count={}", mod_pairs.len()));
+                        for (path, mc, ctx) in mod_pairs {
+                            let entry = mods.entry(path).or_insert_with(|| (ModCount::default(), ctx.clone()));
+                            if mc.total > entry.0.total { entry.0 = mc; entry.1 = ctx; }
+                        }
                     }
                 }
             }
@@ -907,14 +973,21 @@ pub fn scan_warframe_memory(
             // ── Scanner 2: Unique items ───────────────────────────────────────
             let unique_hits = if has_lotus_type { scan_inventory_unique(data, &unique_ac) } else { vec![] };
             if !unique_hits.is_empty() {
-                let preview: String = unique_hits.iter().take(4)
-                    .map(|(li, _)| unique_item_paths[*li].split('/').last().unwrap_or("?"))
+                // Log every hit with the last two path segments so we can distinguish
+                // e.g. "Weapons/BurstonPrime" from "Weapons/BurstonPrimeMk1".
+                let all_names: String = unique_hits.iter()
+                    .map(|(li, _)| {
+                        let p = &unique_item_paths[*li];
+                        let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+                        let tail = if parts.len() >= 2 {
+                            format!("{}/{}", parts[parts.len()-2], parts[parts.len()-1])
+                        } else {
+                            parts.last().copied().unwrap_or("?").to_string()
+                        };
+                        tail
+                    })
                     .collect::<Vec<_>>().join(", ");
-                log_lines.push(format!(
-                    "  [unique] count={}  {}{}",
-                    unique_hits.len(), preview,
-                    if unique_hits.len() > 4 { format!(" +{} more", unique_hits.len()-4) } else { String::new() }
-                ));
+                log_lines.push(format!("  [unique] count={}  {}", unique_hits.len(), all_names));
                 let n = unique_hits.len();
                 for &(local_idx, rank) in &unique_hits {
                     let path = unique_item_paths[local_idx].clone();
@@ -974,9 +1047,11 @@ pub fn scan_warframe_memory(
 
     items_found.sort_by(|a, b| a.name.cmp(&b.name));
 
+    let mods_found: HashMap<String, ModCount> = mods.into_iter().map(|(k, (mc, _))| (k, mc)).collect();
+
     log_lines.push(format!(
-        "  TOTALS: resources={} unique={} total={}",
-        resources.len(), unique.len(), items_found.len()
+        "  TOTALS: resources={} mods={} unique={} total={}",
+        resources.len(), mods_found.len(), unique.len(), items_found.len()
     ));
 
     // Deduplicate pending recipes by unique_name (keep latest completion time)
@@ -986,7 +1061,7 @@ pub fn scan_warframe_memory(
         else { false }
     });
 
-    ScanResult { warframe_running: true, items_found, pending_recipes, mastery_rank, mastery_data: mastery_data_out, regions_scanned, error: None, log_lines, relic_rewards: None, resume_addr: resume_addr_out, hot_addrs: hot_addrs_out, consumed_suits: consumed_suits_out }
+    ScanResult { warframe_running: true, items_found, pending_recipes, mastery_rank, mastery_data: mastery_data_out, regions_scanned, error: None, log_lines, relic_rewards: None, resume_addr: resume_addr_out, hot_addrs: hot_addrs_out, consumed_suits: consumed_suits_out, mods_found }
 }
 
 #[cfg(target_os = "windows")]
@@ -1124,6 +1199,94 @@ pub fn dump_inventory_regions(max_hits: usize) -> Vec<String> {
 #[cfg(not(target_os = "windows"))]
 pub fn dump_inventory_regions(_max_hits: usize) -> Vec<String> {
     vec!["Only supported on Windows".to_string()]
+}
+
+// ─── One-shot inventory blob capture ─────────────────────────────────────────
+//
+// Scans all committed readable regions for the first chunk that contains the
+// inventory root marker ("MiscItems":[).  Saves the full printable-text portion
+// of that region to `output_path` so it can be inspected offline.
+//
+// Non-printable bytes are replaced with '.' so the file is text-editor friendly.
+// Saves up to 8 MB centred on the MiscItems key (4 MB before, 4 MB after).
+
+#[cfg(target_os = "windows")]
+pub fn capture_inventory_blob(output_path: &std::path::Path) -> Result<String, String> {
+    use std::ffi::c_void;
+    use std::mem;
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, FALSE},
+        System::{
+            Diagnostics::Debug::ReadProcessMemory,
+            Memory::{VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS},
+            Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
+        },
+    };
+
+    let pid = find_warframe_pid_pub().ok_or_else(|| "Warframe is not running".to_string())?;
+
+    let process = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid) };
+    if process == 0 { return Err("Could not open Warframe process".to_string()); }
+
+    const MISC_KEY: &[u8]      = b"\"MiscItems\":[";
+    const MIN_BLOB_BYTES: usize = 200_000;    // skip tiny chunks — real inventory is MB-scale
+    const MAX_REGION_READ: usize = 128 * 1024 * 1024;
+    const HALF_SAVE: usize      = 4 * 1024 * 1024;   // 4 MB either side of MiscItems
+
+    let mut addr: usize = 0;
+    let mut saved: Option<(usize, String)> = None; // (region size, message)
+
+    'outer: loop {
+        let mut mbi = unsafe { mem::zeroed::<MEMORY_BASIC_INFORMATION>() };
+        if unsafe { VirtualQueryEx(process, addr as *const c_void, &mut mbi, mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 { break; }
+
+        let region_addr = mbi.BaseAddress as usize;
+        let region_size = mbi.RegionSize;
+        let next_addr   = region_addr.saturating_add(region_size);
+
+        if mbi.State == MEM_COMMIT
+            && mbi.Protect & PAGE_GUARD    == 0
+            && mbi.Protect & PAGE_NOACCESS == 0
+            && region_size >= MIN_BLOB_BYTES
+            && region_size <= MAX_REGION_READ
+        {
+            let mut data = vec![0u8; region_size];
+            let mut n = 0usize;
+            if unsafe { ReadProcessMemory(process, region_addr as *const c_void, data.as_mut_ptr() as *mut c_void, region_size, &mut n) } != 0 && n >= MIN_BLOB_BYTES {
+                let data = &data[..n];
+                if let Some(misc_pos) = data.windows(MISC_KEY.len()).position(|w| w == MISC_KEY) {
+                    let start = misc_pos.saturating_sub(HALF_SAVE);
+                    let end   = (misc_pos + HALF_SAVE).min(data.len());
+                    let text: Vec<u8> = data[start..end].iter()
+                        .map(|&b| if b >= 0x20 && b <= 0x7e || b == b'\n' || b == b'\t' { b } else { b'.' })
+                        .collect();
+                    if let Err(e) = std::fs::write(output_path, &text) {
+                        unsafe { CloseHandle(process); }
+                        return Err(format!("Write failed: {e}"));
+                    }
+                    saved = Some((text.len(), format!(
+                        "Saved {}KB blob (region 0x{:x}, size {}KB, MiscItems at +{}KB) to {}",
+                        text.len() / 1024, region_addr, n / 1024, misc_pos / 1024,
+                        output_path.display()
+                    )));
+                    break 'outer;
+                }
+            }
+        }
+
+        if next_addr <= addr { break; }
+        addr = next_addr;
+    }
+
+    unsafe { CloseHandle(process); }
+
+    saved.map(|(_, msg)| msg)
+         .ok_or_else(|| "No inventory blob found — make sure Warframe is running and inventory is loaded (open Arsenal or Inventory screen)".to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn capture_inventory_blob(_output_path: &std::path::Path) -> Result<String, String> {
+    Err("Only supported on Windows".into())
 }
 
 // ─── Continuous raw memory string dump ───────────────────────────────────────

@@ -166,14 +166,15 @@ function PickArrow({ slotX, winW }: { slotX: number; winW: number }) {
 
 // ─── Reward card ──────────────────────────────────────────────────────────────
 function RewardCard({ item, left, width }: { item: RewardItem; left: number; width: number }) {
-  const hasSet    = !!item.components;
-  const ownedFull = (item.complete_sets ?? 0) >= 1;
+  const hasSet      = !!item.components;
+  const ownedFull   = (item.complete_sets ?? 0) >= 1;
+  const isUnknown   = item.category === "Unrecognized";
 
   return (
-    <div className="ov-card" style={{ left, width }}>
+    <div className={`ov-card${isUnknown ? " ov-card-unknown" : ""}`} style={{ left, width }}>
 
       {/* Item name */}
-      <div className="ov-name">{item.name}</div>
+      <div className="ov-name">{isUnknown ? "? " : ""}{item.name}</div>
 
       {/* Plat price | vaulted lock | ducat value */}
       <div className="ov-price-row">
@@ -268,6 +269,15 @@ export default function Overlay() {
       const byUnique = catalogRef.current;
       const qty      = quantRef.current;
       const base: RewardItem[] = paths.map((path, i) => {
+        if (path.startsWith("?:")) {
+          return {
+            unique_name: path + "-" + i,
+            raw_unique:  "",
+            slot_x:      positions[i] ?? 0.5,
+            name:        path.slice(2),
+            category:    "Unrecognized",
+          };
+        }
         const lk   = path.replace("/Lotus/StoreItems/", "/Lotus/");
         const meta = byUnique[lk] ?? byUnique[path];
         return {
@@ -284,6 +294,9 @@ export default function Overlay() {
       setRewards(base);
 
       paths.forEach(async (path, i) => {
+        // Unknown items — nothing to look up, card already shows raw OCR text.
+        if (path.startsWith("?:")) return;
+
         const lk   = path.replace("/Lotus/StoreItems/", "/Lotus/");
         const meta = byUnique[lk] ?? byUnique[path];
         const name = meta?.name ?? path.split("/").pop() ?? path;

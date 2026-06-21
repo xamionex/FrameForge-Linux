@@ -343,8 +343,11 @@ export default function App() {
   const [wfConnected, setWfConnected] = useState(false);
   const [memoryProbing, setMemoryProbing] = useState(false);
   const [rawScanning, setRawScanning] = useState(false);
+  const [diagCapturing, setDiagCapturing] = useState(false);
+  const [diagPath, setDiagPath] = useState<string | null>(null);
   const [companionApiEnabled, setCompanionApiEnabled] = useState(false);
   const [memoryScannerEnabled, setMemoryScannerEnabled] = useState(false);
+  const [blobLogEnabled, setBlobLogEnabled] = useState(false);
   const [wfmLoggedIn, setWfmLoggedIn] = useState(false);
   const [overlayStatus, setOverlayStatus] = useState("");
   const [subsummedWarframes, setSubsummedWarframes] = useState<Set<string>>(() => {
@@ -432,11 +435,11 @@ export default function App() {
   // Refs so we can read the latest state in the save callback without stale closures
   const settingsLoadedRef = useRef(false);
   const settingsRef = useRef({
-    overlayEnabled: true, overlayPriority: "completion", textScale: 1, colorblindMode: false, companionApiEnabled: false, memoryScannerEnabled: false,
+    overlayEnabled: true, overlayPriority: "completion", textScale: 1, colorblindMode: false, companionApiEnabled: false, memoryScannerEnabled: false, blobLogEnabled: false,
     tracked: [] as string[], favorites: [] as string[], timerFavorites: [] as string[], fissureWatches: [] as FissureWatch[], modularWidth: 240,
     modularSectionOrder: ["tracking", "favorites", "timers"] as string[], modularPopout: false,
   });
-  settingsRef.current = { overlayEnabled, overlayPriority, textScale, colorblindMode, companionApiEnabled, memoryScannerEnabled, tracked, favorites, timerFavorites, fissureWatches, modularWidth, modularSectionOrder, modularPopout };
+  settingsRef.current = { overlayEnabled, overlayPriority, textScale, colorblindMode, companionApiEnabled, memoryScannerEnabled, blobLogEnabled, tracked, favorites, timerFavorites, fissureWatches, modularWidth, modularSectionOrder, modularPopout };
 
   const saveAllSettings = useCallback(() => {
     invoke("save_settings", { json: JSON.stringify(settingsRef.current) }).catch((e) => {
@@ -452,6 +455,11 @@ export default function App() {
       invoke("stop_monitor").then(() => setMonitoring(false)).catch(() => {});
     }
   }, [memoryScannerEnabled]); // eslint-disable-line
+
+  // ── Blob log toggle ───────────────────────────────────────────────────────
+  useEffect(() => {
+    invoke("set_blob_log", { enabled: blobLogEnabled }).catch(() => {});
+  }, [blobLogEnabled]); // eslint-disable-line
 
   // ── Log watcher — always start regardless of memory scanner toggle ─────────
   // EE.log is plain file I/O (not memory reading) — handles riven detection,
@@ -495,6 +503,7 @@ export default function App() {
         const s = JSON.parse(json);
         if (typeof s.companionApiEnabled === "boolean") setCompanionApiEnabled(s.companionApiEnabled);
         if (typeof s.memoryScannerEnabled === "boolean") setMemoryScannerEnabled(s.memoryScannerEnabled);
+        if (typeof s.blobLogEnabled === "boolean") setBlobLogEnabled(s.blobLogEnabled);
         if (typeof s.overlayEnabled === "boolean") {
           setOverlayEnabled(s.overlayEnabled);
           localStorage.setItem("ff-overlay-enabled", String(s.overlayEnabled));
@@ -909,7 +918,7 @@ export default function App() {
 
   useEffect(() => {
     if (settingsLoadedRef.current) saveAllSettings();
-  }, [tracked, favorites, timerFavorites, fissureWatches, modularWidth, memoryScannerEnabled, companionApiEnabled, modularSectionOrder, modularPopout]); // eslint-disable-line
+  }, [tracked, favorites, timerFavorites, fissureWatches, modularWidth, memoryScannerEnabled, companionApiEnabled, blobLogEnabled, modularSectionOrder, modularPopout]); // eslint-disable-line
 
   // ── Modular pop-out window ─────────────────────────────────────────────────
   useEffect(() => {
@@ -1605,6 +1614,19 @@ export default function App() {
                     {memoryScannerEnabled ? "Enabled" : "Disabled"}
                   </button>
                 </div>
+                <div className="settings-row" style={{ opacity: memoryScannerEnabled ? 1 : 0.4, pointerEvents: memoryScannerEnabled ? "auto" : "none" }}>
+                  <div>
+                    <span className="settings-row-label">Inventory Blob Logging</span>
+                    <span className="settings-row-desc">Saves a timestamped inventory blob to blobs/ on each scan pass — for offline analysis</span>
+                  </div>
+                  <button
+                    className="btn-secondary"
+                    style={{ minWidth: 64, background: blobLogEnabled ? "rgba(100,200,100,.15)" : undefined, borderColor: blobLogEnabled ? "#64c864" : undefined, color: blobLogEnabled ? "#64c864" : undefined }}
+                    onClick={() => setBlobLogEnabled(v => !v)}
+                  >
+                    {blobLogEnabled ? "Enabled" : "Disabled"}
+                  </button>
+                </div>
               </div>
 
               {/* ── Companion API toggle ── */}
@@ -1822,6 +1844,37 @@ export default function App() {
                       alert(text);
                     } catch (e) { alert(`Error: ${e}`); }
                   }}>View Log</button>
+                </div>
+                <div className="settings-row" style={{ marginTop: 10 }}>
+                  <div className="settings-row-info">
+                    <span className="settings-row-label">Capture Diagnostics</span>
+                    <span className="settings-row-desc">
+                      Screenshots the full Warframe window (overlay included) and copies the scan log
+                      into a timestamped folder in <code>%TEMP%\warframe-companion\diagnostics\</code>.
+                      Share the folder when reporting scanner or overlay issues.
+                      {diagPath && (
+                        <span style={{ display: "block", marginTop: 4, color: "var(--green)", wordBreak: "break-all", fontSize: 11 }}>
+                          Saved: {diagPath}
+                        </span>
+                      )}
+                    </span>
+                  </div>
+                  <button
+                    className="btn-secondary"
+                    disabled={diagCapturing}
+                    onClick={async () => {
+                      setDiagCapturing(true);
+                      setDiagPath(null);
+                      try {
+                        const path = await invoke<string>("capture_diagnostics");
+                        setDiagPath(path);
+                      } catch (e) {
+                        setDiagPath(`Error: ${e}`);
+                      } finally {
+                        setDiagCapturing(false);
+                      }
+                    }}
+                  >{diagCapturing ? "Capturing…" : "Capture"}</button>
                 </div>
               </div>
 

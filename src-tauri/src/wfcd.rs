@@ -391,7 +391,26 @@ fn resolve_syn_item(
     let no_paren = strip_trailing_paren(&normed);
     let no_qty_no_paren = strip_trailing_paren(&no_qty);
 
-    let candidates: [&str; 4] = [&normed, &no_qty, &no_paren, &no_qty_no_paren];
+    // Strip inline "xN" / "XN" quantity from resource bundle blueprints.
+    // syndicates.json: "Tear Azurite x10 Blueprint" → WFCD: "Tear Azurite Blueprint"
+    let no_inline_xqty = {
+        let suffix = if normed.ends_with(" Blueprint") { " Blueprint" }
+                     else if normed.ends_with(" blueprint") { " blueprint" }
+                     else { "" };
+        if !suffix.is_empty() {
+            let base = &normed[..normed.len() - suffix.len()];
+            // Try both uppercase " X" and lowercase " x"
+            let x_pos = base.rfind(" X").or_else(|| base.rfind(" x"));
+            if let Some(xp) = x_pos {
+                let digits = &base[xp + 2..];
+                if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+                    format!("{}{}", &base[..xp], suffix)
+                } else { normed.clone() }
+            } else { normed.clone() }
+        } else { normed.clone() }
+    };
+
+    let candidates: [&str; 5] = [&normed, &no_qty, &no_paren, &no_qty_no_paren, &no_inline_xqty];
 
     for &candidate in &candidates {
         if candidate.is_empty() {
